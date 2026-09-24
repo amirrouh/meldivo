@@ -1,0 +1,85 @@
+{
+  "name": "pi-meldivo",
+  "version": "0.2.1",
+  "description": "Voice mode for the Pi coding agent: talk to your Pi session hands-free with local, private speech-to-text and text-to-speech (Parakeet + Kokoro). No cloud APIs or keys.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Amir Rouhollahi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amirrouh/meldivo.git"
+  },
+  "homepage": "https://github.com/amirrouh/meldivo#readme",
+  "bugs": {
+    "url": "https://github.com/amirrouh/meldivo/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "pi-extension",
+    "coding-agent",
+    "ai-coding-assistant",
+    "voice",
+    "voice-assistant",
+    "voice-mode",
+    "voice-control",
+    "speech-to-text",
+    "text-to-speech",
+    "stt",
+    "tts",
+    "local-ai",
+    "offline",
+    "privacy",
+    "parakeet",
+    "kokoro",
+    "sherpa-onnx",
+    "hands-free",
+    "llm"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/meldivo.ts"
+    ]
+  },
+  "files": [
+    "extensions",
+    "dist",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "prebuild": "node web/scripts/copy-vad-assets.mjs",
+    "build": "tsc -p server/tsconfig.json && tsc -p web/tsconfig.json && cd web && vite build",
+    "test": "npm run build && node --import tsx --test tests/*.test.mjs",
+    "prepublishOnly": "npm test",
+    "dev:server": "node --env-file-if-exists=.env --import tsx --watch server/src/index.ts",
+    "dev:web": "cd web && vite"
+  },
+  "dependencies": {
+    "express": "^5.0.1",
+    "qrcode": "^1.5.4",
+    "sherpa-onnx-node": "^1.13.8"
+  },
+  "devDependencies": {
+    "@ricky0123/vad-web": "0.0.30",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

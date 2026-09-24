@@ -1,0 +1,28 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.envrc
+*.local
+*.local.*
+*.tsbuildinfo
+.DS_Store
+*.tgz
+
+# Certificates and private keys
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# Internal workspace instructions and notes
+AGENTS.md
+plan.md
+soul.md
+memory.md
+
+# Generated, version-matched VAD model and WebAssembly assets
+web/public/voice-assets/
