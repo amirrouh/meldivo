@@ -1,4 +1,5 @@
 import { uid } from "./uid";
+import { authHeaders } from "./auth";
 
 const LOCK_NAME = "voice-assistant-microphone";
 const FALLBACK_KEY = "voice-assistant-microphone-owner";
@@ -93,7 +94,7 @@ async function acquireWebLockOwnership(): Promise<VoiceOwnership | null> {
 }
 
 async function acquireServerOwnership(onLost: () => void): Promise<VoiceOwnership | null> {
-  const response = await fetch("/api/voice/lease", { method: "POST" });
+  const response = await fetch("/api/voice/lease", { method: "POST", headers: authHeaders() });
   if (response.status === 409) return null;
   if (!response.ok) throw new Error("Could not reserve the voice session.");
   const lease = await response.json() as Partial<ServerLease>;
@@ -106,7 +107,7 @@ async function acquireServerOwnership(onLost: () => void): Promise<VoiceOwnershi
     window.clearInterval(heartbeat);
     void fetch("/api/voice/lease", {
       method: "DELETE",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ token: lease.token }),
       keepalive: true,
     }).catch(() => undefined);
@@ -114,7 +115,7 @@ async function acquireServerOwnership(onLost: () => void): Promise<VoiceOwnershi
   const heartbeat = window.setInterval(() => {
     void fetch("/api/voice/lease/heartbeat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ token: lease.token }),
     }).then((renewal) => {
       if (renewal.status === 409) {
