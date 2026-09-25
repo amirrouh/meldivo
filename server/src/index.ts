@@ -41,14 +41,15 @@ function tlsDir(): string {
 
 // The lock that keeps only one browser tab recording at a time. It is a
 // single process-wide slot rather than per-session state, since only one
-// voice session is ever meant to be live from this machine.
+// voice session is ever meant to be live from this machine. The newest claim
+// wins: a reloaded page or another device takes over immediately, and the
+// previous holder learns it lost the lease on its next heartbeat.
 class VoiceLease {
   private active: { token: string; expiresAt: number } | null = null;
 
   constructor(private readonly ttlMs: number) {}
 
-  claim(): { token: string; expiresAt: number } | null {
-    if (this.active && this.active.expiresAt > Date.now()) return null;
+  claim(): { token: string; expiresAt: number } {
     this.active = { token: randomUUID(), expiresAt: Date.now() + this.ttlMs };
     return this.active;
   }
@@ -398,9 +399,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   });
 
   app.post("/api/voice/lease", (_req, res) => {
-    const lease = voiceLease.claim();
-    if (!lease) return res.status(409).json({ error: "Another voice session is active." });
-    res.status(201).json(lease);
+    res.status(201).json(voiceLease.claim());
   });
 
   app.post("/api/voice/lease/heartbeat", (req, res) => {

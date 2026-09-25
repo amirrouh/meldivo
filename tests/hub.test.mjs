@@ -436,12 +436,6 @@ test("Meldivo hub: voice endpoints", async (t) => {
     assert.equal(claim.status, 201);
     const lease = await claim.json();
 
-    const conflict = await fetch(`${base}/api/voice/lease`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${secret}` },
-    });
-    assert.equal(conflict.status, 409);
-
     const heartbeat = await fetch(`${base}/api/voice/lease/heartbeat`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
@@ -449,10 +443,25 @@ test("Meldivo hub: voice endpoints", async (t) => {
     });
     assert.equal(heartbeat.status, 200);
 
+    // A reloaded page (or another device) takes over; the old holder loses on its next heartbeat.
+    const takeover = await fetch(`${base}/api/voice/lease`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${secret}` },
+    });
+    assert.equal(takeover.status, 201);
+    const newLease = await takeover.json();
+    assert.notEqual(newLease.token, lease.token);
+    const stale = await fetch(`${base}/api/voice/lease/heartbeat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+      body: JSON.stringify({ token: lease.token }),
+    });
+    assert.equal(stale.status, 409);
+
     const release = await fetch(`${base}/api/voice/lease`, {
       method: "DELETE",
       headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
-      body: JSON.stringify({ token: lease.token }),
+      body: JSON.stringify({ token: newLease.token }),
     });
     assert.equal(release.status, 204);
   });
