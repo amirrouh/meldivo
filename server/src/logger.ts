@@ -6,13 +6,13 @@ type LogFields = Record<string, boolean | number | string | undefined>;
 const levelWeight: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 const knownApiPaths = new Set([
   "/api/health",
-  "/api/rooms",
+  "/api/sessions",
+  "/api/remote",
   "/api/voice/lease",
   "/api/voice/lease/heartbeat",
   "/api/voice/transcribe",
   "/api/voice/voices",
   "/api/voice/speech",
-  "/api/chat",
 ]);
 const forbiddenField = /(?:api.?key|auth(?:orization)?|password|token|secret|body|content|message|text|transcript|audio)/i;
 
@@ -57,7 +57,7 @@ export function requestLoggingMiddleware(logger: Logger): RequestHandler {
       logger.info("http_request", {
         request_id: requestId,
         method: req.method,
-        path: safeRequestPath(req.path),
+        path: safeRequestPath(req.originalUrl.split("?")[0]),
         status: res.statusCode,
         duration_ms: elapsedMs(startedAt),
       });
@@ -67,7 +67,7 @@ export function requestLoggingMiddleware(logger: Logger): RequestHandler {
       logger.warn("http_request_aborted", {
         request_id: requestId,
         method: req.method,
-        path: safeRequestPath(req.path),
+        path: safeRequestPath(req.originalUrl.split("?")[0]),
         duration_ms: elapsedMs(startedAt),
       });
     });
@@ -103,6 +103,9 @@ function safeFields(fields: LogFields): LogFields {
 
 function safeRequestPath(path: string): string {
   if (knownApiPaths.has(path)) return path;
+  // Session keys are opaque ids; keep the route shape without them.
+  const sessionRoute = path.match(/^\/api\/sessions\/[^/]+\/(chat|cancel)$/);
+  if (sessionRoute) return `/api/sessions/:key/${sessionRoute[1]}`;
   if (path.startsWith("/api/")) return "/api/unknown";
   return path === "/" ? "/" : "/web-asset";
 }
