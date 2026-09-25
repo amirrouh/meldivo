@@ -26,3 +26,8 @@ memory.md
 
 # Generated, version-matched VAD model and WebAssembly assets
 web/public/voice-assets/
+
+# Private deployment helper
+/update
+/CLAUDE.md
+/AGENTS.md

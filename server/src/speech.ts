@@ -25,13 +25,9 @@ export interface SpeechEngine {
 // ---------------------------------------------------------------------------
 
 const PARAKEET_DIR = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
-// fp32, not int8: benchmarking on the CPU-only target box (AMD Ryzen 9
-// 5900XT, no AVX512-VNNI) showed the int8-quantized Kokoro model is
-// *slower* than fp32 (~2.17s vs ~1.37s synthesis for a 9-word sentence,
-// real-time factor ~1.08 vs ~0.69) because onnxruntime falls back to
-// dequantize-then-compute kernels without VNNI. fp32 also beat the
-// English-only kokoro-en-v0_19 fp32 model (~1.86s) while keeping full
-// multi-language voice support.
+// fp32, not int8: on x86 CPUs without AVX512-VNNI the int8-quantized Kokoro model is
+// slower than fp32, because onnxruntime falls back to dequantize-then-compute kernels.
+// fp32 also beat the English-only kokoro-en-v0_19 model while keeping multi-language voices.
 const KOKORO_DIR = "kokoro-multi-lang-v1_0";
 
 interface ModelSpec {
@@ -80,8 +76,8 @@ const DEFAULT_VOICE = "af_heart";
 // Thread configuration
 // ---------------------------------------------------------------------------
 
-// Kokoro scales well with threads when numThreads is set on the *model* config (measured on a
-// 16-core Ryzen: 1 thread 1.38 s, 8 threads 0.35 s for a short sentence); gains flatten past 8.
+// Kokoro scales well with threads when numThreads is set on the *model* config (about 4x faster
+// at 8 threads than at 1 on a desktop CPU); gains flatten past 8.
 const CPU_COUNT = os.availableParallelism?.() ?? os.cpus().length;
 const DEFAULT_THREADS = Math.min(4, CPU_COUNT);
 const DEFAULT_TTS_THREADS = Math.min(8, CPU_COUNT);

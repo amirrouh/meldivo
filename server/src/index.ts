@@ -94,6 +94,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   const activeTurns = new Map<string, AbortController>();
   const homeDir = homedir();
   const app = express();
+  app.disable("x-powered-by");
   let httpsServer: HttpsServer | undefined;
   let httpsActualPort: number | undefined;
   let sessionsSnapshot: SessionsSnapshot | undefined;

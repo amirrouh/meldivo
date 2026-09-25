@@ -7,6 +7,18 @@ import { BargeInGuard } from "./barge-in-guard";
 import { prepareAudioBuffer } from "./audio-playback";
 import { SpeechPipeline, type PreparedSpeech } from "./speech-pipeline";
 import { vadOptions } from "./vad-config";
+import { EnergyVad } from "./energy-vad";
+
+// A detector is either the real Silero MicVAD or the energy-based fallback;
+// both implement the same start/pause/destroy/setOptions + callback contract.
+type Detector = MicVAD | EnergyVad;
+
+// If Silero/onnxruntime-web fails to initialize once in this page, it will
+// not recover in-page (observed on Safari: ORT wasm backend can be left
+// wedged after repeated reloads/tabs). Remember that across start()/Reconnect
+// calls for the lifetime of the page so we go straight to the energy fallback
+// instead of repeatedly retrying a doomed Silero init.
+let sileroInitFailed = false;
 import { consumeSpeechChunks, hasActiveVoiceTurn, samplesWav } from "./voice";
 import { acquireVoiceOwnership, type VoiceOwnership } from "./voice-ownership";
 import { clearVoicePreference, readVoicePreference, writeVoicePreference } from "./voice-preference";
@@ -124,7 +136,7 @@ export default function App({ sessionKey }: AppProps) {
   const started = useRef(false);
   const starting = useRef(false);
   const speaking = useRef(false);
-  const vad = useRef<MicVAD | null>(null);
+  const vad = useRef<Detector | null>(null);
   const stream = useRef<MediaStream | null>(null);
   const audio = useRef<AudioContext | null>(null);
   const outputGain = useRef<GainNode | null>(null);
@@ -166,6 +178,7 @@ export default function App({ sessionKey }: AppProps) {
   const [sessionDisplay, setSessionDisplay] = useState<SessionDisplay>(() => deriveSessionDisplay(sessionKey));
   const [unauthorized, setUnauthorized] = useState(false);
   const [statusText, setStatusText] = useState("");
+  const [usingFallbackVad, setUsingFallbackVad] = useState(false);
   const [voiceCatalogWarning, setVoiceCatalogWarning] = useState("");
   const [voiceLoading, setVoiceLoading] = useState(false);
   const [voiceError, setVoiceError] = useState("");
@@ -278,6 +291,7 @@ export default function App({ sessionKey }: AppProps) {
     started.current = false;
     starting.current = false;
     settingsMicPaused.current = false;
+    setUsingFallbackVad(false);
     sessionEpoch.current++;
     clearAcceptedWatchdog();
     vadTransitions.current.deactivate();
@@ -311,6 +325,7 @@ export default function App({ sessionKey }: AppProps) {
     if (!started.current) return;
     started.current = false;
     settingsMicPaused.current = false;
+    setUsingFallbackVad(false);
     sessionEpoch.current++;
     clearAcceptedWatchdog();
     vadTransitions.current.deactivate();
@@ -698,7 +713,7 @@ export default function App({ sessionKey }: AppProps) {
     const startup = ++startupGeneration.current;
     let context: AudioContext | null = null;
     let microphone: MediaStream | null = null;
-    let detector: MicVAD | null = null;
+    let detector: Detector | null = null;
     let acquired: VoiceOwnership | null = null;
     let output: GainNode | null = null;
     let nextPipeline: SpeechPipeline | null = null;
@@ -717,6 +732,7 @@ export default function App({ sessionKey }: AppProps) {
       if (!acquired) throw new VoiceOwnershipError();
       ensureCurrentStartup();
       setError("");
+      setUsingFallbackVad(false);
       updateState("thinking");
       context = new AudioContext();
       await context.resume();
@@ -743,12 +759,9 @@ export default function App({ sessionKey }: AppProps) {
       });
       ensureCurrentStartup();
       const activeMicrophone = microphone;
-      const { MicVAD } = await import("@ricky0123/vad-web");
-      ensureCurrentStartup();
-      detector = await MicVAD.new({
-        model: "v5", audioContext: context, startOnLoad: false,
-        baseAssetPath: "/voice-assets/", onnxWASMBasePath: "/voice-assets/",
-        ortConfig: (ort) => { ort.env.wasm.numThreads = 1; },
+      // Both detectors drive this exact same callback contract, so it is
+      // built once and shared regardless of which one ends up running.
+      const detectorCallbacks = {
         getStream: async () => activeMicrophone, pauseStream: async () => {}, resumeStream: async () => activeMicrophone,
         ...vadOptions,
         submitUserSpeechOnPause: true,
@@ -784,12 +797,12 @@ export default function App({ sessionKey }: AppProps) {
           restoreOutput();
           if (!muted.current) syncState();
         },
-        onFrameProcessed: (probabilities, frame) => {
+        onFrameProcessed: (probabilities: { isSpeech: number }, frame: Float32Array) => {
           if (!isCurrentVad(detector, session)) return;
           transcription.current?.frame(probabilities.isSpeech, frame);
           setLevel(Math.min(1, Math.sqrt(frame.reduce((total, value) => total + value * value, 0) / frame.length) * 7));
         },
-        onSpeechEnd: (samples) => {
+        onSpeechEnd: (samples: Float32Array) => {
           if (!isCurrentVad(detector, session)) return;
           clearAcceptedWatchdog();
           if (!bargeIn.current.speechEnd()) {
@@ -806,7 +819,34 @@ export default function App({ sessionKey }: AppProps) {
           echoReference.current = "";
           input.current?.speechEnded({ samples, possibleEcho });
         },
-      });
+      };
+      let fallbackActive = false;
+      if (!sileroInitFailed) {
+        try {
+          const { MicVAD } = await import("@ricky0123/vad-web");
+          ensureCurrentStartup();
+          detector = await MicVAD.new({
+            model: "v5", audioContext: context, startOnLoad: false,
+            baseAssetPath: "/voice-assets/", onnxWASMBasePath: "/voice-assets/",
+            ortConfig: (ort) => { ort.env.wasm.numThreads = 1; },
+            ...detectorCallbacks,
+          });
+        } catch (caught) {
+          if (caught instanceof DOMException && caught.name === "AbortError") throw caught;
+          // Silero/onnxruntime-web cannot recover in-page once it has failed
+          // to initialize (e.g. wedged wasm backend after many reloads).
+          // Remember that for the rest of the page and go straight to the
+          // energy-based fallback on this and every future start().
+          sileroInitFailed = true;
+          detector = null;
+        }
+      }
+      if (!detector) {
+        fallbackActive = true;
+        detector = await EnergyVad.new({ audioContext: context, ...detectorCallbacks });
+      }
+      ensureCurrentStartup();
+      setUsingFallbackVad(fallbackActive);
       await vadTransitions.current.start(detector);
       ensureCurrentStartup();
       const activeDetector = detector;
@@ -825,6 +865,7 @@ export default function App({ sessionKey }: AppProps) {
         if (stream.current !== activeMicrophone || !started.current) return;
         started.current = false;
         settingsMicPaused.current = false;
+        setUsingFallbackVad(false);
         sessionEpoch.current++;
         clearAcceptedWatchdog();
         vadTransitions.current.deactivate();
@@ -889,7 +930,7 @@ export default function App({ sessionKey }: AppProps) {
     }
   };
 
-  const isCurrentVad = (candidate: MicVAD | null, session: number) => (
+  const isCurrentVad = (candidate: Detector | null, session: number) => (
     (started.current || starting.current)
     && !settingsOpenRef.current
     && isCurrentVoiceSession(
@@ -902,7 +943,7 @@ export default function App({ sessionKey }: AppProps) {
     )
   );
 
-  const ownsCurrentVad = (candidate: MicVAD | null, expectedMuted: boolean, session?: number) => (
+  const ownsCurrentVad = (candidate: Detector | null, expectedMuted: boolean, session?: number) => (
     candidate !== null
     && vad.current === candidate
     && started.current
@@ -910,13 +951,13 @@ export default function App({ sessionKey }: AppProps) {
     && (session === undefined || sessionEpoch.current === session)
   );
 
-  const isReadyVadTransition = (candidate: MicVAD | null, expectedMuted: boolean, session?: number) => (
+  const isReadyVadTransition = (candidate: Detector | null, expectedMuted: boolean, session?: number) => (
     ownsCurrentVad(candidate, expectedMuted, session)
     && candidate !== null
     && !vadTransitions.current.isInvalid(candidate)
   );
 
-  const armAcceptedWatchdog = (candidate: MicVAD | null, session: number) => {
+  const armAcceptedWatchdog = (candidate: Detector | null, session: number) => {
     clearAcceptedWatchdog();
     if (!candidate) return;
     acceptedWatchdog.current = window.setTimeout(() => {
@@ -1150,6 +1191,7 @@ export default function App({ sessionKey }: AppProps) {
       {sessionDisplay.cwd && <span className="room-header__cwd">{sessionDisplay.cwd}</span>}
     </header>
     {statusText && <p className="room-status" role="status">{statusText}</p>}
+    {usingFallbackVad && <p className="room-status voice-fallback-notice" role="status">Using basic voice detection</p>}
     {!speechHealth.ready && <p className="voice-health" role="status">
       {speechHealth.error || speechStatusLabel}
     </p>}

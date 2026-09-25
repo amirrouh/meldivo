@@ -18,6 +18,7 @@ button { font: inherit; }
 .room-header__title { font-weight: 600; }
 .room-header__cwd { color: rgb(208 214 228 / .55); font-size: 11px; }
 .room-status { position: fixed; z-index: 3; top: 88px; left: 50%; margin: 0; padding: 5px 10px; transform: translateX(-50%); border: 1px solid rgb(255 255 255 / .12); border-radius: 999px; background: rgb(13 15 21 / .8); color: rgb(208 214 228 / .82); font-size: 11px; white-space: nowrap; }
+.voice-fallback-notice { top: 112px; }
 @keyframes orbit-one { to { rotate: 1turn; } } @keyframes orbit-two { to { rotate: 1turn; } } @keyframes breathe { 50% { scale: 1.08; filter: brightness(1.15); } } @keyframes shake { 25% { translate: -7px; } 75% { translate: 7px; } } @media (prefers-reduced-motion: reduce) { .voice-shape *, .voice-page::before, .voice-page::after { animation: none !important; transition-duration: .01ms !important; } }
 
 .voice-context-menu, .voice-settings { position: fixed; z-index: 5; border: 1px solid rgb(255 255 255 / .14); border-radius: 12px; background: rgb(13 15 21 / .96); box-shadow: 0 12px 36px rgb(0 0 0 / .35); color: rgb(240 243 250); backdrop-filter: blur(16px); }

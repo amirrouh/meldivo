@@ -55,10 +55,15 @@ export function createAccessGate(secret: string): AccessGate {
 }
 
 function setSessionCookie(req: Request, res: Response, value: string): void {
-  const secure = req.secure || req.get("x-forwarded-proto") === "https";
+  // Secure everywhere except plain-http localhost, whatever a (spoofable) X-Forwarded-Proto says.
+  const secure = req.secure || !isLoopbackHost(req.hostname);
   const attributes = [`${COOKIE_NAME}=${value}`, "Path=/", `Max-Age=${COOKIE_MAX_AGE_S}`, "HttpOnly", "SameSite=Strict"];
   if (secure) attributes.push("Secure");
   res.setHeader("Set-Cookie", attributes.join("; "));
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "::1" || hostname === "[::1]" || /^127\./.test(hostname);
 }
 
 function readCookie(req: Request, name: string): string | undefined {

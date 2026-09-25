@@ -62,6 +62,13 @@ function ensureDir(dir, mode) {
   mkdirSync(dir, { recursive: true, mode });
 }
 
+// Owner-only, also when the file already existed with looser permissions (writeFileSync's mode
+// only applies on creation). Several of these files contain the secret.
+function writePrivate(file, data) {
+  writeFileSync(file, data, { mode: 0o600 });
+  chmodSync(file, 0o600);
+}
+
 function ensureSecret() {
   ensureDir(configDir(), 0o700);
   const file = secretPath();
@@ -70,8 +77,7 @@ function ensureSecret() {
     if (existing) return existing;
   }
   const secret = randomBytes(32).toString("hex");
-  writeFileSync(file, secret, { mode: 0o600 });
-  chmodSync(file, 0o600);
+  writePrivate(file, secret);
   return secret;
 }
 
@@ -85,7 +91,7 @@ function readRuntime() {
 
 function writeRuntime(data) {
   ensureDir(configDir(), 0o700);
-  writeFileSync(runtimePath(), JSON.stringify(data, null, 2), { mode: 0o600 });
+  writePrivate(runtimePath(), JSON.stringify(data, null, 2));
 }
 
 function resolvePort() {
@@ -206,7 +212,7 @@ RestartSec=2
 [Install]
 WantedBy=default.target
 `;
-  writeFileSync(systemdUnitPath(), unit, { mode: 0o600 });
+  writePrivate(systemdUnitPath(), unit);
   run("systemctl", ["--user", "daemon-reload"]);
   run("systemctl", ["--user", "enable", "--now", "meldivo.service"]);
   run("systemctl", ["--user", "restart", "meldivo.service"]); // pick up a new unit or package version
@@ -244,7 +250,7 @@ ${envEntries}
 </plist>
 `;
   ensureDir(stateDir(), 0o700);
-  writeFileSync(launchAgentPath(), plist, { mode: 0o600 });
+  writePrivate(launchAgentPath(), plist);
   const uid = process.getuid?.() ?? 0;
   run("launchctl", ["bootout", `gui/${uid}/dev.meldivo`]); // ignore failure if not loaded
   run("launchctl", ["bootstrap", `gui/${uid}`, launchAgentPath()]);
@@ -260,7 +266,7 @@ function startDetached(env) {
     stdio: ["ignore", out, out],
   });
   child.unref();
-  writeFileSync(pidPath(), String(child.pid), { mode: 0o600 });
+  writePrivate(pidPath(), String(child.pid));
 }
 
 function openLogFd() {

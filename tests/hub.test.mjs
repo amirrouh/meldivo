@@ -164,6 +164,7 @@ test("Meldivo hub: auth and /api/sessions shape", async (t) => {
   await t.test("health works with the secret", async () => {
     const response = await fetch(`${base}/api/health`, { headers: { "x-meldivo-token": secret } });
     assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-powered-by"), null);
     assert.equal((await response.json()).ok, true);
     assert.equal(response.headers.get("cache-control"), "private, no-cache");
   });

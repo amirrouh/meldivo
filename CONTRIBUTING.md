@@ -1,5 +1,17 @@
 # Contributing to meldivo
 
+## Privacy first
+
+meldivo can read and drive your coding-agent sessions, so privacy comes before every other concern:
+
+- Never commit or publish secrets, tokens, real IP addresses, hostnames, domains, personal paths, emails,
+  or real session content. Use placeholders such as `voice.example.com` and `<vpn-ip>`; test fixtures
+  must be synthetic.
+- Review `git diff --cached` and `npm pack --dry-run` before every commit and release.
+- Keep the access gate strict: nothing, including the page itself, is served without the secret, the server
+  listens on `127.0.0.1` by default, and the secret must never be logged or cached by shared proxies.
+- Never add telemetry or any network call other than downloading the speech models.
+
 ## Layout
 
 - `bin/meldivo.mjs` — the CLI entry point (`meldivo start|stop|status|open|

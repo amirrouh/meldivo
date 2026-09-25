@@ -3,17 +3,19 @@
 // On load we lift it into storage and scrub it from the visible URL.
 
 const sessionKey = "meldivo.token";
-const localKey = "meldivo.token";
+// Older versions persisted the raw key in localStorage; it is only ever removed now. The HttpOnly
+// session cookie (see server access.ts) keeps the browser signed in across visits instead.
+const legacyLocalKey = "meldivo.token";
 
 let cachedToken: string | null | undefined;
 
 /** Runs once on startup: reads `#token=` from the URL, persists it, and cleans the URL. */
 export function initAuth(): void {
+  try { window.localStorage.removeItem(legacyLocalKey); } catch { /* storage may be unavailable */ }
   const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
   const token = fragment.get("token");
   if (!token) return;
   try { window.sessionStorage.setItem(sessionKey, token); } catch { /* storage may be unavailable */ }
-  try { window.localStorage.setItem(localKey, token); } catch { /* storage may be unavailable */ }
   cachedToken = token;
   try {
     window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
@@ -23,7 +25,7 @@ export function initAuth(): void {
 export function getAuthToken(): string | null {
   if (cachedToken !== undefined) return cachedToken;
   try {
-    cachedToken = window.sessionStorage.getItem(sessionKey) ?? window.localStorage.getItem(localKey);
+    cachedToken = window.sessionStorage.getItem(sessionKey);
   } catch {
     cachedToken = null;
   }
