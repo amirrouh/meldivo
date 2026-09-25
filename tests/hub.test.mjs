@@ -180,6 +180,13 @@ test("Meldivo hub: auth and /api/sessions shape", async (t) => {
     assert.equal(body.sessions.length, 1);
     assert.equal(body.sessions[0].key, "claude:abc");
   });
+
+  await t.test("accepts the secret as X-Meldivo-Token for proxies that strip Authorization", async () => {
+    const ok = await fetch(`${base}/api/sessions`, { headers: { "x-meldivo-token": secret, authorization: "Basic dTpw" } });
+    assert.equal(ok.status, 200);
+    const wrong = await fetch(`${base}/api/sessions`, { headers: { "x-meldivo-token": "wrong" } });
+    assert.equal(wrong.status, 401);
+  });
 });
 
 test("Meldivo hub: chat over an existing closed session continues it directly", async (t) => {

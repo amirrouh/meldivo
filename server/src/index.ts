@@ -22,6 +22,8 @@ const HARNESS_ORDER: HarnessId[] = ["pi", "opencode", "claude"];
 export interface StartServerOptions {
   port?: number;
   host?: string;
+  /** Extra addresses to listen on as well, e.g. a VPN address for a reverse proxy. */
+  extraHosts?: string[];
   secret: string;
   publicUrl?: string;
   speech?: SpeechEngine;
@@ -95,11 +97,12 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     res.json({ ok: true, speech: speech.status() });
   });
 
-  // Every other /api route requires the bearer secret, compared timing-safe.
+  // Every other /api route requires the secret, compared timing-safe. The web app sends it as
+  // X-Meldivo-Token so it survives reverse proxies that use (and strip) Authorization for their
+  // own basic auth; a Bearer Authorization header is accepted as well.
   app.use("/api", (req, res, next) => {
-    const authorization = req.get("authorization");
-    const bearer = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
-    if (!bearer || !secureTokenEqual(secret, bearer)) return res.status(401).json({ error: "Meldivo secret is required" });
+    const token = req.get("x-meldivo-token") ?? req.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
+    if (!token || !secureTokenEqual(secret, token)) return res.status(401).json({ error: "Meldivo secret is required" });
     next();
   });
 
@@ -454,16 +457,24 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     httpServer.once("error", reject);
   });
   const actualPort = (httpServer!.address() as AddressInfo).port;
+  const extraServers: Server[] = [];
+  for (const extraHost of options.extraHosts ?? []) {
+    await new Promise<void>((resolve, reject) => {
+      const extra = app.listen(actualPort, extraHost, () => resolve());
+      extra.once("error", reject);
+      extraServers.push(extra);
+    });
+  }
   (remoteManager as unknown as { opts: { httpPort: number } }).opts.httpPort = actualPort;
-  logger.info("server_started", { host, port: actualPort });
+  logger.info("server_started", { host, extraHosts: (options.extraHosts ?? []).join(","), port: actualPort });
 
   async function close(): Promise<void> {
     for (const controller of activeTurns.values()) controller.abort();
     activeTurns.clear();
     await Promise.all([
-      new Promise<void>((resolve, reject) => {
-        httpServer.close((error) => (error ? reject(error) : resolve()));
-      }),
+      ...[httpServer, ...extraServers].map((server) => new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      })),
       remoteManager.stop(),
       disableHttps(),
     ]);
@@ -539,7 +550,8 @@ if (isMainModule) {
   const publicUrl = process.env.MELDIVO_PUBLIC_URL?.trim() || undefined;
   const modelsDir = process.env.MELDIVO_MODELS_DIR?.trim() || undefined;
   const speech = createSherpaEngine(modelsDir ? { modelsDir } : undefined);
-  void startServer({ port, host: "127.0.0.1", secret, publicUrl, speech, httpsPort });
+  const extraHosts = (process.env.MELDIVO_HOST ?? "").split(",").map((value) => value.trim()).filter((value) => value && value !== "127.0.0.1");
+  void startServer({ port, host: "127.0.0.1", extraHosts, secret, publicUrl, speech, httpsPort });
   // Download and load the voice models in the background so the first turn is fast.
   speech.warmup?.().catch((error: unknown) => console.error("speech warmup failed:", error));
 }

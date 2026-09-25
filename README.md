@@ -118,6 +118,7 @@ All settings are optional.
 | `MELDIVO_PORT` | `4100` | Port of the local server (`127.0.0.1` only). |
 | `MELDIVO_HTTPS_PORT` | `4443` | HTTPS port used by the "own certificate" remote option. |
 | `MELDIVO_PUBLIC_URL` | unset | Base URL to print when you run your own reverse proxy. |
+| `MELDIVO_HOST` | unset | Extra addresses to listen on besides `127.0.0.1` (comma-separated), e.g. a VPN address your reverse proxy forwards to. |
 | `MELDIVO_MODELS_DIR` | `~/.cache/meldivo/models` | Location of the downloaded speech models. |
 
 ## Files and locations

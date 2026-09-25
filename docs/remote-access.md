@@ -145,11 +145,17 @@ site to a device that trusts your CA).
 If you'd rather run your own reverse proxy (Caddy, nginx, etc.) with a real
 domain, that works too:
 
-- Proxy your domain to `http://127.0.0.1:4100`.
+- Proxy your domain to `http://127.0.0.1:4100`. If the proxy runs on another
+  machine (for example a server on your VPN), also listen on that machine's
+  VPN address: `MELDIVO_HOST=<vpn-ip> meldivo start`, and proxy to
+  `http://<vpn-ip>:4100`.
 - Make sure streaming/SSE responses aren't buffered (e.g. in nginx,
   `proxy_buffering off;` on the relevant location).
 - Set `MELDIVO_PUBLIC_URL` to the externally reachable address so Meldivo
-  prints the right link.
+  prints the right link: `MELDIVO_PUBLIC_URL=https://voice.example.com meldivo start`.
+  Both settings are remembered for later restarts.
+- Basic auth on the proxy is fine: Meldivo sends its own token in the
+  `X-Meldivo-Token` header, so it doesn't conflict with the proxy's password.
 
 ## Troubleshooting
 

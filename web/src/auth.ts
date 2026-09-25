@@ -33,7 +33,7 @@ export function getAuthToken(): string | null {
 /** Headers for every authenticated /api call (all but GET /api/health). */
 export function authHeaders(): Record<string, string> {
   const token = getAuthToken();
-  return token ? { Authorization: `Bearer ${token}` } : {};
+  return token ? { "X-Meldivo-Token": token } : {};
 }
 
 export class UnauthorizedError extends Error {

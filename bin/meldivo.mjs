@@ -96,6 +96,15 @@ function resolveHttpsPort() {
   return Number(process.env.MELDIVO_HTTPS_PORT) || readRuntime().httpsPort || DEFAULT_HTTPS_PORT;
 }
 
+// Settings given once (e.g. `MELDIVO_PUBLIC_URL=... meldivo start`) persist in runtime.json.
+function resolvePublicUrl() {
+  return (process.env.MELDIVO_PUBLIC_URL ?? readRuntime().publicUrl ?? "").replace(/\/+$/, "");
+}
+
+function resolveHost() {
+  return process.env.MELDIVO_HOST ?? readRuntime().host ?? "";
+}
+
 function baseUrl() {
   return `http://127.0.0.1:${resolvePort()}`;
 }
@@ -106,7 +115,7 @@ async function qrText(url) {
 }
 
 function hubUrl(secret) {
-  return `${baseUrl()}/#token=${encodeURIComponent(secret)}`;
+  return `${resolvePublicUrl() || baseUrl()}/#token=${encodeURIComponent(secret)}`;
 }
 
 async function printUrl(secret) {
@@ -148,7 +157,10 @@ function serviceEnv(port, httpsPort) {
     MELDIVO_PORT: String(port),
     MELDIVO_HTTPS_PORT: String(httpsPort),
   };
-  if (process.env.MELDIVO_PUBLIC_URL) env.MELDIVO_PUBLIC_URL = process.env.MELDIVO_PUBLIC_URL;
+  const publicUrl = resolvePublicUrl();
+  if (publicUrl) env.MELDIVO_PUBLIC_URL = publicUrl;
+  const host = resolveHost();
+  if (host) env.MELDIVO_HOST = host;
   if (process.env.MELDIVO_MODELS_DIR) env.MELDIVO_MODELS_DIR = process.env.MELDIVO_MODELS_DIR;
   env.PATH = servicePath();
   return env;
@@ -295,7 +307,7 @@ async function cmdStart(args) {
   const port = resolvePort();
   const httpsPort = resolveHttpsPort();
   const secret = ensureSecret();
-  writeRuntime({ port, httpsPort });
+  writeRuntime({ port, httpsPort, publicUrl: resolvePublicUrl() || undefined, host: resolveHost() || undefined });
 
   if (foreground) {
     process.env.MELDIVO_SECRET = secret;
