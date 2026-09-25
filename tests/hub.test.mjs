@@ -374,6 +374,64 @@ test("Meldivo hub: cancel aborts a running turn, and one turn at a time per key"
   await response.body?.cancel().catch(() => undefined);
 });
 
+test("Meldivo hub: cancel finds a new:<harness> turn by its resolved <harness>:<id> key too", async (t) => {
+  // Regression test: the browser client learns "<harness>:<id>" from the
+  // turn's "session" SSE event and switches to it immediately (including for
+  // a barge-in cancel sent mid-turn), well before the turn ends. Before this
+  // fix, /cancel only recognized the original "new:<harness>" request key, so
+  // a cancel sent with the resolved key 404'd and the turn kept running.
+  const secret = "s".repeat(32);
+  const claude = fakeAdapter("claude", "Claude Code");
+  claude.queueSend(async function* (target, text, signal) {
+    yield { type: "session", id: "s1" };
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, 5_000);
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(new DOMException("aborted", "AbortError"));
+      });
+    });
+    yield { type: "done" };
+  });
+  const server = await startServer({
+    port: 0,
+    secret,
+    speech: fakeSpeechEngine(),
+    webDir: "/does/not/exist",
+    adapters: [fakeAdapter("pi", "Pi"), fakeAdapter("opencode", "OpenCode"), claude],
+    stateDir: tmpStateDir(),
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.port}`;
+
+  const chatPromise = fetch(`${base}/api/sessions/new:claude/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ message: "hi", conversationId: "conv-alias-cancel" }),
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const cancel = await fetch(`${base}/api/sessions/claude:s1/cancel`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${secret}` },
+  });
+  assert.equal(cancel.status, 204);
+
+  const response = await chatPromise;
+  assert.equal(response.status, 200);
+  // Wait for the turn to actually finish (not just for the streaming headers,
+  // which arrive before the abort even propagates) so the route's cleanup has
+  // run before checking that the alias was cleared.
+  await readSseUntilDone(response);
+
+  // The alias is cleaned up with the turn: a later request reusing the same id is not "busy".
+  const again = await fetch(`${base}/api/sessions/claude:s1/cancel`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${secret}` },
+  });
+  assert.equal(again.status, 404);
+});
+
 test("Meldivo hub: voice endpoints", async (t) => {
   const secret = "s".repeat(32);
   const server = await startServer({

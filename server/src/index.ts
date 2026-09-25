@@ -179,7 +179,16 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     message: string,
     signal: AbortSignal,
     res: express.Response,
-    opts: { allowFallback?: boolean; onSessionId?: (id: string) => void | Promise<void> } = {},
+    opts: {
+      allowFallback?: boolean;
+      onSessionId?: (id: string) => void | Promise<void>;
+      // Fired the instant the session id is known, mid-stream, well before the
+      // turn ends. Lets the caller register an alias for cancellation: a
+      // "new:<harness>" turn's client learns the resolved key from this same
+      // event and switches to it immediately, so /cancel must find the turn
+      // under either the original request key or the resolved one.
+      onLiveSessionId?: (id: string) => void;
+    } = {},
   ): Promise<AttemptOutcome> {
     const allowFallback = opts.allowFallback ?? false;
     const buffered: TurnEvent[] = [];
@@ -204,7 +213,10 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
 
     try {
       for await (const event of adapter.send(target, message, signal)) {
-        if (event.type === "session") sessionId = event.id;
+        if (event.type === "session") {
+          sessionId = event.id;
+          opts.onLiveSessionId?.(event.id);
+        }
         if (event.type === "delta") sawDelta = true;
 
         if (allowFallback && !sawDelta) {
@@ -274,7 +286,14 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     }
   }
 
-  async function runNew(harness: HarnessId, message: string, conversationId: string | undefined, signal: AbortSignal, res: express.Response): Promise<void> {
+  async function runNew(
+    harness: HarnessId,
+    message: string,
+    conversationId: string | undefined,
+    signal: AbortSignal,
+    res: express.Response,
+    onLiveSessionId?: (id: string) => void,
+  ): Promise<void> {
     const adapter = adapterById.get(harness);
     if (!adapter) {
       sendEvent(res, { type: "error", message: `Unknown harness "${harness}"` });
@@ -288,6 +307,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     }
     await attempt(adapter, { id, cwd: homeDir, fork: false }, message, signal, res, {
       onSessionId: (sessionId) => (conversationId ? stateStore.setConversation(conversationId, { harness, id: sessionId }) : undefined),
+      onLiveSessionId,
     });
   }
 
@@ -351,11 +371,22 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     });
     res.flushHeaders();
 
+    // A "new:<harness>" turn tells its client the resolved "<harness>:<id>" key
+    // as soon as the underlying session id is known (see the "session" SSE
+    // event), well before the turn ends. The client switches to that key
+    // immediately, including for a barge-in /cancel sent mid-turn - so the
+    // resolved key must also resolve to this same controller.
+    let aliasKey: string | undefined;
+    const registerAlias = (id: string) => {
+      aliasKey = `${key.slice(4)}:${id}`;
+      if (!activeTurns.has(aliasKey)) activeTurns.set(aliasKey, controller);
+    };
+
     try {
       if (key === "quick") {
         await runQuick(message, conversationId, controller.signal, res);
       } else if (key.startsWith("new:")) {
-        await runNew(key.slice(4) as HarnessId, message, conversationId, controller.signal, res);
+        await runNew(key.slice(4) as HarnessId, message, conversationId, controller.signal, res, registerAlias);
       } else {
         const sep = key.indexOf(":");
         if (sep < 0) {
@@ -367,6 +398,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       }
     } finally {
       if (activeTurns.get(key) === controller) activeTurns.delete(key);
+      if (aliasKey && activeTurns.get(aliasKey) === controller) activeTurns.delete(aliasKey);
     }
   });
 

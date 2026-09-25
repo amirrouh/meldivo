@@ -141,6 +141,12 @@ export default function App({ sessionKey }: AppProps) {
   const errorToken = useRef(0);
   const conversationId = useRef(getConversationId(sessionKey));
   const liveKey = useRef(sessionKey);
+  // The key the server registered the in-flight turn's AbortController under (the
+  // request key at POST time). A "new:<harness>" turn rewrites liveKey to the
+  // resolved "<harness>:<id>" as soon as its SSE "session" event arrives, which can
+  // happen well before the turn ends - cancelling with the rewritten liveKey would
+  // then 404 against a server-side map still keyed by the original request key.
+  const activeChatKey = useRef<string | null>(null);
   const harnessRef = useRef<HarnessId | undefined>(deriveSessionDisplay(sessionKey).harness);
   const generation = useRef(0);
   const outputFrame = useRef(0);
@@ -256,10 +262,12 @@ export default function App({ sessionKey }: AppProps) {
     pipeline.current?.cancel();
     stopMeter();
     if (wasActive) {
-      void fetch(`/api/sessions/${encodeURIComponent(liveKey.current)}/cancel`, {
+      const key = activeChatKey.current ?? liveKey.current;
+      void fetch(`/api/sessions/${encodeURIComponent(key)}/cancel`, {
         method: "POST", headers: authHeaders(),
       }).catch(() => undefined);
     }
+    activeChatKey.current = null;
     if (!muted.current && started.current) updateState("listening");
   };
   const interruptActiveTurn = () => {
@@ -605,7 +613,9 @@ export default function App({ sessionKey }: AppProps) {
       if (!message || id !== generation.current) { syncState(); return; }
       assistantAudio.current = "";
       turnVoice.current = readVoicePreference();
-      const response = await fetch(`/api/sessions/${encodeURIComponent(liveKey.current)}/chat`, {
+      const chatKey = liveKey.current;
+      activeChatKey.current = chatKey;
+      const response = await fetch(`/api/sessions/${encodeURIComponent(chatKey)}/chat`, {
         method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...authHeaders() },
         body: JSON.stringify({ conversationId: conversationId.current, message }), signal: controller.signal,
       });
@@ -672,7 +682,10 @@ export default function App({ sessionKey }: AppProps) {
         if (!spoken) pipeline.current?.enqueue(["Sorry, I could not answer that. Please try again."]);
       }
     } finally {
-      if (chat.current === controller) chat.current = null;
+      if (chat.current === controller) {
+        chat.current = null;
+        activeChatKey.current = null;
+      }
       harnessTurnActive.current = false;
       if (mounted.current) setStatusText("");
       syncState();
