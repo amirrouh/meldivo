@@ -1,14 +1,30 @@
-# Contributing to pi-meldivo
+# Contributing to meldivo
 
 ## Layout
 
-- `extensions/meldivo.ts` — the Pi extension. Registers `/meldivo`, starts the
-  local server on demand, and relays turns between the Pi session and the
-  server's adapter API.
-- `server/src/` — the local Express server (speech, rooms, static hosting).
-  Compiles to `dist/server/`.
-- `web/src/` — the browser voice UI (React + Vite). Builds to `dist/web/`.
+- `bin/meldivo.mjs` — the CLI entry point (`meldivo start|stop|status|open|
+  remote|logs|uninstall|--version`). Installs and manages the user service
+  (systemd `--user` on Linux, launchd on macOS) and talks to the running
+  server over HTTP.
+- `server/src/index.ts` — the Express server: HTTP/HTTPS listeners, hub API,
+  static hosting for the built web UI, and process lifecycle.
+- `server/src/speech.ts` — local speech-to-text (Parakeet) and text-to-speech
+  (Kokoro) via `sherpa-onnx-node`.
+- `server/src/remote.ts` — phone/tablet access: Tailscale, Cloudflare quick
+  tunnel, and own-certificate setup.
+- `server/src/qr.ts` — QR code rendering for hub and remote-access links.
+- `server/src/harnesses/` — one adapter per coding agent (`pi.ts`,
+  `opencode.ts`, `claude.ts`), implementing the contract in
+  `server/src/harnesses/types.ts`: session discovery and headless turn
+  execution.
+- `web/src/Hub.tsx` — the hub page: session list, new-chat tiles, and the
+  phone access panel.
+- `web/src/App.tsx` — the voice room UI (recording, live transcription,
+  playback) for a single session.
 - `tests/` — Node test-runner (`.test.mjs`) integration tests.
+
+Compiled output goes to `dist/` (`dist/server`, `dist/web`); it is not
+committed.
 
 ## Build & test
 
@@ -30,12 +46,23 @@ functions/variables, `PascalCase` for React components/types. No formatter or
 linter is configured; `npm run build` is the required type-check. Avoid
 unrelated churn in a diff.
 
-## Contract between the extension and the server
+## Harness adapter contract
 
-The extension spawns `dist/server/index.js` as `node <path>` when
-`GET /api/health` isn't reachable, passing `MELDIVO_SECRET` in its
-environment. It then creates a room with `POST /api/rooms`
-(`x-meldivo-secret` header) and polls `/api/rooms/:id/adapter/next` for
-voice-originated turns, delivering assistant replies to
-`/api/rooms/:id/adapter/events`. Keep this contract in mind when changing
-either side.
+Every coding agent the hub supports is a `HarnessAdapter` implementation, as
+defined in `server/src/harnesses/types.ts`:
+
+- `available()` reports whether the agent's CLI is installed and runnable.
+- `listSessions(limit?)` returns that agent's sessions, most recently updated
+  first, found by reading its own session files — no plugin or extension
+  runs inside the agent itself. Each `SessionInfo` reports whether the
+  session is currently `open` in a terminal process.
+- `send(target, text, signal)` runs one user turn headlessly, streaming
+  `TurnEvent`s (status, tool calls, text deltas, notices, errors, and a final
+  `done`). When `target.fork` is set — because the session is open in a
+  terminal — the adapter must continue the session as a fork instead of
+  writing into the live session file, so the terminal copy is never
+  disturbed.
+
+Keep this contract in mind, and keep the three adapters' behavior consistent,
+when changing `server/src/harnesses/types.ts` or any adapter under
+`server/src/harnesses/`.

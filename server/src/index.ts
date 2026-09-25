@@ -1,29 +1,23 @@
-import { timingSafeEqual as secureCompare } from "node:crypto";
+import { randomUUID, timingSafeEqual as secureCompare } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import type { AddressInfo } from "node:net";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import express from "express";
-import { MeldivoHub, type HarnessKind, type MeldivoRoom } from "./hub.js";
+import { createAdapters, listAllSessions } from "./harnesses/index.js";
+import type { HarnessAdapter, HarnessId, SendTarget, SessionInfo, TurnEvent } from "./harnesses/types.js";
 import { createLogger, requestLoggingMiddleware } from "./logger.js";
+import { detectRemoteOptions, RemoteManager, remoteGuideUrl, type RemoteId } from "./remote.js";
 import { createSherpaEngine, type SpeechEngine } from "./speech.js";
+import { defaultStateDir, SessionStateStore } from "./state.js";
 
-type ActiveHarnessTurn = { controller: AbortController; roomId: string; turnId: string; res: express.Response };
-type ActiveVoiceLease = { token: string; expiresAt: number };
-type AdapterEvent =
-  | { turnId: string; type: "delta"; text: string }
-  | { turnId: string; type: "done" }
-  | { turnId: string; type: "error"; error: string };
-
-// Rooms without any adapter/browser activity for this long are dropped, so a
-// crashed Pi session or an abandoned tab does not linger forever.
-const ROOM_IDLE_TTL_MS = 8 * 60 * 60 * 1_000;
 const VOICE_LEASE_TTL_MS = 15_000;
-const DEFAULT_IDLE_SHUTDOWN_MS = 10 * 60 * 1_000;
-const IDLE_CHECK_INTERVAL_MS = 10_000;
+const SESSIONS_CACHE_MS = 3_000;
+const SESSIONS_LIMIT = 50;
+const HARNESS_ORDER: HarnessId[] = ["pi", "opencode", "claude"];
 
 export interface StartServerOptions {
   port?: number;
@@ -31,39 +25,33 @@ export interface StartServerOptions {
   secret: string;
   publicUrl?: string;
   speech?: SpeechEngine;
-  idleShutdownMs?: number;
+  adapters?: HarnessAdapter[];
   webDir?: string;
-  /** Port for the optional certificate-based HTTPS listener (see /api/remote/https). */
+  stateDir?: string;
   httpsPort?: number;
 }
 
-// Where a user-supplied TLS certificate for remote access lives, mirroring the
-// extension's own config-dir resolution so both sides agree without coupling.
+// Where a user-supplied TLS certificate for remote access lives.
 function tlsDir(): string {
   const base = process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config");
   return path.join(base, "meldivo", "tls");
 }
 
 // The lock that keeps only one browser tab recording at a time. It is a
-// single process-wide slot rather than per-room state, since only one voice
-// session is ever meant to be live from this machine.
+// single process-wide slot rather than per-session state, since only one
+// voice session is ever meant to be live from this machine.
 class VoiceLease {
-  private active: ActiveVoiceLease | null = null;
+  private active: { token: string; expiresAt: number } | null = null;
 
   constructor(private readonly ttlMs: number) {}
 
-  claim(): ActiveVoiceLease | null {
+  claim(): { token: string; expiresAt: number } | null {
     if (this.active && this.active.expiresAt > Date.now()) return null;
-    this.active = { token: crypto.randomUUID(), expiresAt: Date.now() + this.ttlMs };
+    this.active = { token: randomUUID(), expiresAt: Date.now() + this.ttlMs };
     return this.active;
   }
 
-  // A late heartbeat from the lease's own holder must still succeed even past
-  // expiresAt, as long as nobody else has claimed the lease since (claim()
-  // would have overwritten the token). Otherwise a single delayed heartbeat
-  // (tab throttling, a slow TTS turn) evicts the caller's own session and
-  // reports it as if another tab had taken over.
-  renew(token: string | null): ActiveVoiceLease | null {
+  renew(token: string | null): { token: string; expiresAt: number } | null {
     if (!token || !this.active || this.active.token !== token) return null;
     this.active = { ...this.active, expiresAt: Date.now() + this.ttlMs };
     return this.active;
@@ -74,18 +62,31 @@ class VoiceLease {
   }
 }
 
+type SessionsSnapshot = {
+  at: number;
+  harnesses: { id: HarnessId; label: string; available: boolean }[];
+  sessions: SessionInfo[];
+};
+
+type AttemptOutcome = "committed" | "failed";
+
 export async function startServer(options: StartServerOptions): Promise<{ port: number; close(): Promise<void> }> {
   const host = options.host ?? "127.0.0.1";
   const secret = options.secret;
   const speech = options.speech ?? createSherpaEngine();
   const webDir = options.webDir ?? fileURLToPath(new URL("../web", import.meta.url));
+  const stateDir = options.stateDir ?? defaultStateDir();
   const logger = createLogger();
-  const hub = new MeldivoHub(ROOM_IDLE_TTL_MS);
+  const adapters = options.adapters ?? createAdapters();
+  const adapterById = new Map(adapters.map((adapter) => [adapter.id, adapter]));
+  const stateStore = new SessionStateStore(stateDir);
   const voiceLease = new VoiceLease(VOICE_LEASE_TTL_MS);
-  const activeHarnessTurns = new Map<string, ActiveHarnessTurn>();
+  const activeTurns = new Map<string, AbortController>();
+  const homeDir = homedir();
   const app = express();
   let httpsServer: HttpsServer | undefined;
   let httpsActualPort: number | undefined;
+  let sessionsSnapshot: SessionsSnapshot | undefined;
 
   app.use(requestLoggingMiddleware(logger));
   app.use(express.json({ limit: "1mb" }));
@@ -94,92 +95,14 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     res.json({ ok: true, speech: speech.status() });
   });
 
-  // A room deep link must use the origin of the request that asked for it, so
-  // the hub page (and its microphone) stays same-origin with the browser, no
-  // matter which address or port it was reached on.
-  function roomOrigin(req: express.Request): string {
-    const forwardedHost = req.get("host");
-    if (!forwardedHost) return options.publicUrl ?? `http://localhost:${actualPort}`;
-    const proto = (req.get("x-forwarded-proto") || "").split(",")[0]!.trim().toLowerCase();
-    const scheme = proto === "https" || req.secure ? "https" : "http";
-    return `${scheme}://${forwardedHost}`;
-  }
-
-  function hasSecret(req: express.Request): boolean {
-    const header = req.get("x-meldivo-secret");
-    return typeof header === "string" && secureTokenEqual(secret, header);
-  }
-
-  function readRoomToken(req: express.Request): string | undefined {
+  // Every other /api route requires the bearer secret, compared timing-safe.
+  app.use("/api", (req, res, next) => {
     const authorization = req.get("authorization");
     const bearer = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
-    const header = req.get("x-meldivo-room-token");
-    const bodyToken = req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>).roomToken : undefined;
-    const token = bearer ?? header ?? bodyToken;
-    return typeof token === "string" && /^[A-Za-z0-9_-]{32,128}$/.test(token) ? token : undefined;
-  }
-
-  function authorizedRoom(req: express.Request): MeldivoRoom | undefined {
-    const roomId = readRoomId(req.params.roomId);
-    return hub.authorize(roomId, readRoomToken(req));
-  }
-
-  // Voice endpoints are not scoped to a single room in the URL, but they must
-  // still be gated on a live room's own capability token rather than left open.
-  function authorizedByToken(req: express.Request): MeldivoRoom | undefined {
-    return hub.authorizeToken(readRoomToken(req));
-  }
-
-  app.post("/api/rooms", (req, res) => {
-    if (!hasSecret(req)) return res.status(401).json({ error: "Meldivo secret is required" });
-    const input = readRoomCreateRequest(req.body);
-    if (!input) return res.status(400).json({ error: "mode must be harness and harness must be pi" });
-    const created = hub.create(input);
-    const url = `${roomOrigin(req)}/?room=${encodeURIComponent(created.room.id)}#token=${encodeURIComponent(created.token)}`;
-    res.status(201).set("Cache-Control", "no-store").json({ room: created.room, token: created.token, url });
+    if (!bearer || !secureTokenEqual(secret, bearer)) return res.status(401).json({ error: "Meldivo secret is required" });
+    next();
   });
 
-  app.get("/api/rooms/:roomId", (req, res) => {
-    const room = authorizedRoom(req);
-    if (!room) return res.status(401).json({ error: "Invalid room capability" });
-    res.set("Cache-Control", "no-store").json({ room: hub.public(room) });
-  });
-
-  app.delete("/api/rooms/:roomId", (req, res) => {
-    const roomId = readRoomId(req.params.roomId);
-    const room = hasSecret(req) ? (roomId ? hub.get(roomId) : undefined) : authorizedRoom(req);
-    if (!room) return res.status(401).json({ error: "Invalid room capability" });
-    abortHarnessTurn(room.id, "Voice room was closed");
-    hub.close(room);
-    res.status(204).end();
-  });
-
-  // A harness adapter polls this endpoint. It is deliberately pull-based so a
-  // local plugin can reconnect without the hub having to reach into a terminal.
-  app.post("/api/rooms/:roomId/adapter/next", (req, res) => {
-    const room = authorizedRoom(req);
-    if (!room) return res.status(401).json({ error: "Invalid room capability" });
-    const turn = hub.nextTurn(room);
-    if (!turn) return res.status(204).end();
-    res.set("Cache-Control", "no-store").json(turn);
-  });
-
-  app.post("/api/rooms/:roomId/adapter/events", (req, res) => {
-    const room = authorizedRoom(req);
-    if (!room) return res.status(401).json({ error: "Invalid room capability" });
-    const event = readAdapterEvent(req.body);
-    if (!event) return res.status(400).json({ error: "A valid adapter event is required" });
-    const turn = activeHarnessTurns.get(event.turnId);
-    if (!turn || turn.roomId !== room.id || turn.controller.signal.aborted) return res.status(409).json({ error: "Turn is no longer active" });
-    if (event.type === "delta") sendEvent(turn.res, { type: "delta", text: event.text });
-    else if (event.type === "error") finishHarnessTurn(turn, { type: "error", error: event.error });
-    else finishHarnessTurn(turn, { type: "done" });
-    res.status(202).end();
-  });
-
-  // Lets the Pi extension turn a user-supplied TLS certificate into a real
-  // HTTPS listener for remote access, without the extension needing to
-  // manage a Node https server itself. Idempotent in both directions.
   async function enableHttps(): Promise<number> {
     if (httpsServer && httpsActualPort) return httpsActualPort;
     const certPath = path.join(tlsDir(), "cert.pem");
@@ -209,49 +132,280 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     });
   }
 
-  app.post("/api/remote/https", (req, res) => {
-    if (!hasSecret(req)) return res.status(401).json({ error: "Meldivo secret is required" });
-    const enable = (req.body as Record<string, unknown> | undefined)?.enable;
-    if (typeof enable !== "boolean") return res.status(400).json({ error: "enable must be a boolean" });
-    const result = enable ? enableHttps() : disableHttps().then(() => null);
-    result
-      .then((port) => res.status(200).json({ port }))
-      .catch((error) => res.status(502).json({ error: messageFor(error) }));
+  const remoteManager = new RemoteManager({
+    httpPort: 0, // patched to the real port once listen() resolves, below
+    enableHttps,
+    disableHttps,
+    buildUrl: (origin) => `${origin}/#token=${encodeURIComponent(secret)}`,
   });
 
-  app.post("/api/voice/lease", (req, res) => {
-    if (!authorizedByToken(req)) return res.status(401).json({ error: "Invalid room capability" });
+  async function getSessionsSnapshot(): Promise<SessionsSnapshot> {
+    if (sessionsSnapshot && Date.now() - sessionsSnapshot.at < SESSIONS_CACHE_MS) return sessionsSnapshot;
+    const [sessions, availability, forkIds] = await Promise.all([
+      listAllSessions(adapters, SESSIONS_LIMIT),
+      Promise.all(adapters.map(async (adapter) => ({ id: adapter.id, label: adapter.label, available: await adapter.available() }))),
+      stateStore.allForkIds(),
+    ]);
+    // Voice forks are an implementation detail of continuing an open session;
+    // hide them from the list so they don't show up as extra sessions.
+    const visible = sessions.filter((session) => !forkIds.has(session.id));
+    sessionsSnapshot = { at: Date.now(), harnesses: availability, sessions: visible };
+    return sessionsSnapshot;
+  }
+
+  app.get("/api/sessions", async (_req, res) => {
+    const snapshot = await getSessionsSnapshot();
+    res.set("Cache-Control", "no-store").json({ machine: hostname(), harnesses: snapshot.harnesses, sessions: snapshot.sessions });
+  });
+
+  // Runs one candidate adapter for one turn, streaming its events to `res`.
+  // When `allowFallback` is set, events are buffered until the first delta;
+  // an error before any delta is swallowed and reported as "failed" so the
+  // caller can retry with the next harness instead. Once a delta (or a
+  // terminal event) has been seen, the outcome is final ("committed").
+  async function attempt(
+    adapter: HarnessAdapter,
+    target: SendTarget,
+    message: string,
+    signal: AbortSignal,
+    res: express.Response,
+    opts: { allowFallback?: boolean; onSessionId?: (id: string) => void | Promise<void> } = {},
+  ): Promise<AttemptOutcome> {
+    const allowFallback = opts.allowFallback ?? false;
+    const buffered: TurnEvent[] = [];
+    let sawDelta = false;
+    let sessionId: string | undefined;
+
+    // Persists the session/fork id (if any) *before* the terminal event
+    // reaches the client, so a caller's very next request — sent the
+    // instant it observes "done" — never races the bookkeeping that
+    // request depends on (e.g. the busy-lock for this key, or which
+    // session a fork continues).
+    const persist = async (): Promise<void> => {
+      if (sessionId && opts.onSessionId) await opts.onSessionId(sessionId);
+    };
+    const endWith = async (terminal: TurnEvent): Promise<void> => {
+      await persist();
+      flush(res, buffered);
+      buffered.length = 0;
+      sendEvent(res, terminal);
+      if (!res.writableEnded) res.end();
+    };
+
+    try {
+      for await (const event of adapter.send(target, message, signal)) {
+        if (event.type === "session") sessionId = event.id;
+        if (event.type === "delta") sawDelta = true;
+
+        if (allowFallback && !sawDelta) {
+          if (event.type === "error") return "failed";
+          if (event.type === "done") {
+            await endWith(event);
+            return "committed";
+          }
+          buffered.push(event);
+          continue;
+        }
+
+        if (event.type === "error" || event.type === "done") {
+          await endWith(event);
+          return "committed";
+        }
+
+        if (buffered.length > 0) {
+          flush(res, buffered);
+          buffered.length = 0;
+        }
+        sendEvent(res, event);
+      }
+      // Defensive: the generator ended without an explicit done/error event.
+      await endWith({ type: "done" });
+      return "committed";
+    } catch (error) {
+      if (allowFallback && !sawDelta) return "failed";
+      await endWith({ type: "error", message: messageFor(error) });
+      return "committed";
+    }
+  }
+
+  async function runQuick(message: string, conversationId: string | undefined, signal: AbortSignal, res: express.Response): Promise<void> {
+    const conversation = conversationId ? await stateStore.getConversation(conversationId) : undefined;
+    if (conversation) {
+      const adapter = adapterById.get(conversation.harness as HarnessId);
+      if (adapter) {
+        await attempt(adapter, { id: conversation.id, cwd: homeDir, fork: false }, message, signal, res, {
+          onSessionId: (id) => (conversationId ? stateStore.setConversation(conversationId, { harness: adapter.id, id }) : undefined),
+        });
+        return;
+      }
+    }
+
+    const candidates: HarnessAdapter[] = [];
+    for (const id of HARNESS_ORDER) {
+      const adapter = adapterById.get(id);
+      if (adapter && (await adapter.available())) candidates.push(adapter);
+    }
+    if (candidates.length === 0) {
+      sendEvent(res, { type: "error", message: "No coding-agent CLI is available on this machine" });
+      res.end();
+      return;
+    }
+
+    for (let index = 0; index < candidates.length; index++) {
+      const adapter = candidates[index]!;
+      const isLast = index === candidates.length - 1;
+      const outcome = await attempt(adapter, { id: null, cwd: homeDir, fork: false }, message, signal, res, {
+        allowFallback: !isLast,
+        onSessionId: (id) => (conversationId ? stateStore.setConversation(conversationId, { harness: adapter.id, id }) : undefined),
+      });
+      if (outcome === "committed") return;
+      const next = candidates[index + 1]!;
+      sendEvent(res, { type: "status", message: `${adapter.label} unavailable, using ${next.label}` });
+    }
+  }
+
+  async function runNew(harness: HarnessId, message: string, conversationId: string | undefined, signal: AbortSignal, res: express.Response): Promise<void> {
+    const adapter = adapterById.get(harness);
+    if (!adapter) {
+      sendEvent(res, { type: "error", message: `Unknown harness "${harness}"` });
+      res.end();
+      return;
+    }
+    let id: string | null = null;
+    if (conversationId) {
+      const conversation = await stateStore.getConversation(conversationId);
+      if (conversation && conversation.harness === harness) id = conversation.id;
+    }
+    await attempt(adapter, { id, cwd: homeDir, fork: false }, message, signal, res, {
+      onSessionId: (sessionId) => (conversationId ? stateStore.setConversation(conversationId, { harness, id: sessionId }) : undefined),
+    });
+  }
+
+  async function findSession(harness: HarnessId, id: string): Promise<SessionInfo | undefined> {
+    const snapshot = await getSessionsSnapshot();
+    const cached = snapshot.sessions.find((session) => session.harness === harness && session.id === id);
+    if (cached) return cached;
+    const adapter = adapterById.get(harness);
+    if (!adapter) return undefined;
+    const deeper = await adapter.listSessions(200).catch((): SessionInfo[] => []);
+    return deeper.find((session) => session.id === id);
+  }
+
+  async function runExisting(key: string, harness: HarnessId, id: string, message: string, signal: AbortSignal, res: express.Response): Promise<void> {
+    const adapter = adapterById.get(harness);
+    if (!adapter) {
+      sendEvent(res, { type: "error", message: `Unknown harness "${harness}"` });
+      res.end();
+      return;
+    }
+    const info = await findSession(harness, id);
+    if (!info) {
+      sendEvent(res, { type: "error", message: "Session not found" });
+      res.end();
+      return;
+    }
+
+    if (info.open) {
+      const forkId = await stateStore.getFork(key);
+      if (forkId) {
+        await attempt(adapter, { id: forkId, cwd: info.cwd, model: info.model, fork: false }, message, signal, res);
+      } else {
+        await attempt(adapter, { id: info.id, cwd: info.cwd, model: info.model, fork: true }, message, signal, res, {
+          onSessionId: (newId) => stateStore.setFork(key, newId),
+        });
+      }
+    } else {
+      await attempt(adapter, { id: info.id, cwd: info.cwd, model: info.model, fork: false }, message, signal, res);
+    }
+  }
+
+  app.post("/api/sessions/:key/chat", async (req, res) => {
+    const key = req.params.key!;
+    const message = readMessage(req.body?.message);
+    if (!message) return res.status(400).json({ error: "message is required" });
+    if (activeTurns.has(key)) return res.status(409).json({ error: "This session is busy" });
+    const conversationId = readConversationId(req.body?.conversationId);
+
+    const controller = new AbortController();
+    activeTurns.set(key, controller);
+    req.on("aborted", () => controller.abort());
+    res.on("close", () => {
+      if (!res.writableEnded) controller.abort();
+    });
+
+    res.status(200).set({
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    res.flushHeaders();
+
+    try {
+      if (key === "quick") {
+        await runQuick(message, conversationId, controller.signal, res);
+      } else if (key.startsWith("new:")) {
+        await runNew(key.slice(4) as HarnessId, message, conversationId, controller.signal, res);
+      } else {
+        const sep = key.indexOf(":");
+        if (sep < 0) {
+          sendEvent(res, { type: "error", message: "Invalid session key" });
+          res.end();
+        } else {
+          await runExisting(key, key.slice(0, sep) as HarnessId, key.slice(sep + 1), message, controller.signal, res);
+        }
+      }
+    } finally {
+      if (activeTurns.get(key) === controller) activeTurns.delete(key);
+    }
+  });
+
+  app.post("/api/sessions/:key/cancel", (req, res) => {
+    const key = req.params.key!;
+    const controller = activeTurns.get(key);
+    if (!controller) return res.status(404).json({ error: "No active turn for this session" });
+    controller.abort();
+    res.status(204).end();
+  });
+
+  app.get("/api/remote", (_req, res) => {
+    res.set("Cache-Control", "no-store").json({ options: detectRemoteOptions(), active: remoteManager.status().active, guide: remoteGuideUrl });
+  });
+
+  app.post("/api/remote", async (req, res) => {
+    const id = readRemoteId(req.body?.id);
+    if (!id) return res.status(400).json({ error: "id must be one of tailscale, cloudflare, certificate" });
+    try {
+      const result = await remoteManager.start(id);
+      res.status(200).json(result);
+    } catch (error) {
+      res.status(502).json({ error: messageFor(error) });
+    }
+  });
+
+  app.delete("/api/remote", async (_req, res) => {
+    await remoteManager.stop();
+    res.status(204).end();
+  });
+
+  app.post("/api/voice/lease", (_req, res) => {
     const lease = voiceLease.claim();
     if (!lease) return res.status(409).json({ error: "Another voice session is active." });
     res.status(201).json(lease);
   });
 
   app.post("/api/voice/lease/heartbeat", (req, res) => {
-    if (!authorizedByToken(req)) return res.status(401).json({ error: "Invalid room capability" });
     const lease = voiceLease.renew(readLeaseToken(req.body?.token));
     if (!lease) return res.status(409).json({ error: "Voice session is no longer active." });
     res.json(lease);
   });
 
   app.delete("/api/voice/lease", (req, res) => {
-    if (!authorizedByToken(req)) return res.status(401).json({ error: "Invalid room capability" });
     voiceLease.release(readLeaseToken(req.body?.token));
     res.status(204).end();
   });
 
-  app.post("/api/chat", (req, res) => {
-    const conversationId = readConversationId(req.body?.conversationId);
-    const message = readMessage(req.body?.message);
-    if (!conversationId || !message) return res.status(400).json({ error: "conversationId and message are required" });
-    const roomId = readRoomId(req.body?.roomId);
-    const room = hub.authorize(roomId, readRoomToken(req));
-    if (!room) return res.status(401).json({ error: "Invalid room capability" });
-    startHarnessChat(room, message, req, res);
-  });
-
   app.post("/api/voice/transcribe", express.raw({ type: "audio/wav", limit: "16mb" }), async (req, res) => {
-    const room = authorizedByToken(req);
-    if (!room) return res.status(401).json({ error: "Invalid room capability" });
     if (!Buffer.isBuffer(req.body) || req.body.length < 44 || req.body.toString("ascii", 0, 4) !== "RIFF") {
       return res.status(400).json({ error: "A WAV recording is required" });
     }
@@ -264,15 +418,11 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     }
   });
 
-  app.get("/api/voice/voices", (req, res) => {
-    const room = authorizedByToken(req);
-    if (!room) return res.status(401).json({ error: "Invalid room capability" });
+  app.get("/api/voice/voices", (_req, res) => {
     res.set("Cache-Control", "no-store").json({ current: speech.defaultVoice, voices: speech.voices() });
   });
 
   app.post("/api/voice/speech", async (req, res) => {
-    const room = authorizedByToken(req);
-    if (!room) return res.status(401).json({ error: "Invalid room capability" });
     const text = readSpeechText(req.body?.text);
     if (!text) return res.status(400).json({ error: "text must contain 1–1200 characters" });
     const requestedVoice = req.body?.voice === undefined ? undefined : readVoice(req.body.voice);
@@ -298,85 +448,23 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   }
   app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
 
-  function abortHarnessTurn(roomId: string, reason: string): void {
-    const active = [...activeHarnessTurns.values()].find((turn) => turn.roomId === roomId);
-    if (active) {
-      active.controller.abort();
-      finishHarnessTurn(active, { type: "error", error: reason });
-    }
-  }
-
-  function abortHarnessTurnById(turnId: string): void {
-    const active = activeHarnessTurns.get(turnId);
-    if (!active) return;
-    active.controller.abort();
-    activeHarnessTurns.delete(turnId);
-    hub.removeTurnById(active.roomId, active.turnId);
-  }
-
-  function finishHarnessTurn(turn: ActiveHarnessTurn, event: { type: "done" } | { type: "error"; error: string }): void {
-    if (activeHarnessTurns.get(turn.turnId) !== turn) return;
-    activeHarnessTurns.delete(turn.turnId);
-    hub.removeTurnById(turn.roomId, turn.turnId);
-    if (!turn.res.destroyed && !turn.res.writableEnded) {
-      sendEvent(turn.res, event);
-      turn.res.end();
-    }
-  }
-
-  function startHarnessChat(room: MeldivoRoom, message: string, req: express.Request, res: express.Response): void {
-    abortHarnessTurn(room.id, "A newer voice request replaced this one");
-    const controller = new AbortController();
-    const adapterTurn = hub.enqueueTurn(room, message);
-    const turn: ActiveHarnessTurn = { controller, roomId: room.id, turnId: adapterTurn.turnId, res };
-    activeHarnessTurns.set(turn.turnId, turn);
-    req.on("aborted", () => abortHarnessTurnById(turn.turnId));
-    res.on("close", () => {
-      if (!res.writableEnded) abortHarnessTurnById(turn.turnId);
-    });
-    res.status(200).set({
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      "X-Accel-Buffering": "no",
-    });
-    res.flushHeaders();
-    sendEvent(res, { type: "status", message: "Waiting for the coding agent", turnId: turn.turnId });
-  }
-
   let httpServer: Server;
   await new Promise<void>((resolve, reject) => {
     httpServer = app.listen(options.port ?? 0, host, () => resolve());
     httpServer.once("error", reject);
   });
   const actualPort = (httpServer!.address() as AddressInfo).port;
+  (remoteManager as unknown as { opts: { httpPort: number } }).opts.httpPort = actualPort;
   logger.info("server_started", { host, port: actualPort });
 
-  let idleTimer: ReturnType<typeof setInterval> | undefined;
-  let idleSince: number | undefined;
-  const idleShutdownMs = options.idleShutdownMs ?? DEFAULT_IDLE_SHUTDOWN_MS;
-  if (idleShutdownMs > 0) {
-    idleTimer = setInterval(() => {
-      if (hub.size() > 0) {
-        idleSince = undefined;
-        return;
-      }
-      idleSince ??= Date.now();
-      if (Date.now() - idleSince < idleShutdownMs) return;
-      clearInterval(idleTimer);
-      void close().then(() => {
-        if (isMainModule) process.exit(0);
-      });
-    }, IDLE_CHECK_INTERVAL_MS);
-    idleTimer.unref?.();
-  }
-
   async function close(): Promise<void> {
-    if (idleTimer) clearInterval(idleTimer);
+    for (const controller of activeTurns.values()) controller.abort();
+    activeTurns.clear();
     await Promise.all([
       new Promise<void>((resolve, reject) => {
         httpServer.close((error) => (error ? reject(error) : resolve()));
       }),
+      remoteManager.stop(),
       disableHttps(),
     ]);
   }
@@ -384,47 +472,14 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   return { port: actualPort, close };
 }
 
+function flush(res: express.Response, events: TurnEvent[]): void {
+  for (const event of events) sendEvent(res, event);
+}
+
 function secureTokenEqual(expected: string, candidate: string): boolean {
   const expectedBytes = Buffer.from(expected);
   const candidateBytes = Buffer.from(candidate);
   return expectedBytes.length === candidateBytes.length && secureCompare(expectedBytes, candidateBytes);
-}
-
-function readRoomId(value: unknown): string | undefined {
-  return typeof value === "string" && /^[0-9a-f-]{36}$/i.test(value) ? value : undefined;
-}
-
-function readRoomCreateRequest(value: unknown): { harness: HarnessKind; cwd?: string; label?: string } | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  if (record.mode !== "harness" || record.harness !== "pi") return undefined;
-  const cwd = readRoomText(record.cwd, 2_000);
-  const label = readRoomText(record.label, 120);
-  if ((record.cwd !== undefined && !cwd) || (record.label !== undefined && !label)) return undefined;
-  return { harness: "pi", ...(cwd ? { cwd } : {}), ...(label ? { label } : {}) };
-}
-
-function readRoomText(value: unknown, max: number): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const text = value.trim();
-  return text && text.length <= max && !/[\u0000-\u001f]/.test(text) ? text : undefined;
-}
-
-function readAdapterEvent(value: unknown): AdapterEvent | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  const turnId = readRoomId(record.turnId);
-  if (!turnId || typeof record.type !== "string") return undefined;
-  if (record.type === "done") return { turnId, type: "done" };
-  if (record.type === "delta") {
-    const text = readSpeechText(record.text);
-    return text ? { turnId, type: "delta", text } : undefined;
-  }
-  if (record.type === "error") {
-    const error = readRoomText(record.error, 1_000);
-    return error ? { turnId, type: "error", error } : undefined;
-  }
-  return undefined;
 }
 
 function readConversationId(value: unknown): string | undefined {
@@ -453,7 +508,11 @@ function readLeaseToken(value: unknown): string | null {
   return typeof value === "string" && value.length >= 16 && value.length <= 128 ? value : null;
 }
 
-function sendEvent(res: express.Response, event: object): void {
+function readRemoteId(value: unknown): RemoteId | undefined {
+  return value === "tailscale" || value === "cloudflare" || value === "certificate" ? value : undefined;
+}
+
+function sendEvent(res: express.Response, event: TurnEvent | { type: "status"; message: string }): void {
   res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 

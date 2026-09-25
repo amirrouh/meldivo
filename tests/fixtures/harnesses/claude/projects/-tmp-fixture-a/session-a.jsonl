@@ -1,0 +1,4 @@
+{"type":"queue-operation","operation":"enqueue","timestamp":"2024-01-01T00:00:00.000Z","sessionId":"session-a-id"}
+{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the login bug"}]},"cwd":"/tmp/fixture-a","sessionId":"session-a-id"}
+{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"Sure, looking now."}]},"cwd":"/tmp/fixture-a","sessionId":"session-a-id"}
+{"type":"custom-title","customTitle":"Fix login bug","sessionId":"session-a-id"}

@@ -11,6 +11,40 @@ import { consumeSpeechChunks, hasActiveVoiceTurn, samplesWav } from "./voice";
 import { acquireVoiceOwnership, type VoiceOwnership } from "./voice-ownership";
 import { clearVoicePreference, readVoicePreference, writeVoicePreference } from "./voice-preference";
 import { uid } from "./uid";
+import { authHeaders, checkAuthorized, UnauthorizedError } from "./auth";
+import { UnauthorizedScreen } from "./UnauthorizedScreen";
+import { harnessLabel, type HarnessId, type SessionsResponse, type TurnEvent } from "./session-types";
+
+interface AppProps {
+  sessionKey: string;
+}
+
+type SessionDisplay = { harness?: HarnessId; title: string; cwd: string };
+
+function deriveSessionDisplay(key: string): SessionDisplay {
+  if (key.startsWith("new:")) return { harness: key.slice(4) as HarnessId, title: "New chat", cwd: "~" };
+  if (key === "quick") return { title: "Quick chat", cwd: "~" };
+  const separator = key.indexOf(":");
+  if (separator === -1) return { title: key, cwd: "" };
+  return { harness: key.slice(0, separator) as HarnessId, title: key.slice(separator + 1), cwd: "" };
+}
+
+function conversationStorageKey(sessionKey: string): string {
+  return `meldivo.conversation.${sessionKey}`;
+}
+
+function getConversationId(sessionKey: string): string {
+  const key = conversationStorageKey(sessionKey);
+  try {
+    const existing = window.sessionStorage.getItem(key);
+    if (existing) return existing;
+    const created = uid();
+    window.sessionStorage.setItem(key, created);
+    return created;
+  } catch {
+    return uid();
+  }
+}
 
 type VoiceState = "idle" | "listening" | "hearing" | "thinking" | "running" | "speaking" | "muted" | "error";
 const acceptedSpeechWatchdogMs = 12_000;
@@ -23,34 +57,6 @@ type ContextMenuPosition = { x: number; y: number };
 type VoiceListResponse = { current?: unknown; voices?: unknown; available?: unknown; warning?: unknown };
 type SpeechHealth = { ready: boolean; downloading: boolean; progress?: number; error?: string };
 type HealthResponse = { ok?: unknown; speech?: { ready?: unknown; downloading?: unknown; progress?: unknown; error?: unknown } };
-type MeldivoRoomCredentials = { id: string; token: string };
-type MeldivoRoom = { harness?: string };
-
-function readMeldivoRoomCredentials(): MeldivoRoomCredentials | null {
-  const room = new URLSearchParams(window.location.search).get("room");
-  if (!room || !/^[0-9a-f-]{36}$/i.test(room)) return null;
-  const fragment = new URLSearchParams(window.location.hash.slice(1));
-  const fromUrl = fragment.get("token");
-  const storedKey = `meldivo.room.${room}`;
-  const stored = (() => {
-    try { return window.sessionStorage.getItem(storedKey); } catch { return null; }
-  })();
-  const token = fromUrl ?? stored;
-  if (!token || !/^[A-Za-z0-9_-]{32,128}$/.test(token)) return null;
-  if (fromUrl) {
-    try {
-      window.sessionStorage.setItem(storedKey, token);
-      // Fragments are not sent to the server, but removing it also keeps a
-      // copied address bar or screenshot from exposing a room capability.
-      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
-    } catch {
-      // Keep the fragment if session storage is unavailable so a refresh can
-      // still reconnect to this private room.
-    }
-  }
-  return { id: room, token };
-}
-
 
 function friendlyLabel(value: string): string {
   const kokoroVoice = /^([a-z]{2})[_-](.+)$/i.exec(value);
@@ -86,11 +92,7 @@ class VoiceOwnershipError extends Error {
   }
 }
 
-async function streamDeltas(
-  response: Response,
-  onDelta: (delta: string) => void,
-  onStatus?: (message: string) => void,
-) {
+async function streamTurnEvents(response: Response, onEvent: (event: TurnEvent) => void) {
   if (!response.body) throw new Error("Chat response was empty.");
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let pending = "";
@@ -103,22 +105,16 @@ async function streamDeltas(
     for (const line of lines) {
       if (!line.startsWith("data:")) continue;
       const data = line.slice(5).trim();
-      if (!data || data === "[DONE]") continue;
-      let event: Record<string, unknown>;
-      try { event = JSON.parse(data); } catch { continue; }
-      if (event.type === "error") throw new Error(typeof event.error === "string" ? event.error : "Chat request failed.");
+      if (!data) continue;
+      let event: TurnEvent;
+      try { event = JSON.parse(data) as TurnEvent; } catch { continue; }
+      onEvent(event);
       if (event.type === "done") return;
-      if (event.type === "status" && typeof event.message === "string") {
-        onStatus?.(event.message);
-        continue;
-      }
-      const delta = event.delta ?? event.text ?? event.content ?? (event.choices as Array<{ delta?: { content?: unknown } }> | undefined)?.[0]?.delta?.content;
-      if (typeof delta === "string") onDelta(delta);
     }
   }
 }
 
-export default function App() {
+export default function App({ sessionKey }: AppProps) {
   const [state, setState] = useState<VoiceState>("idle");
   const [level, setLevel] = useState(0);
   const [error, setError] = useState("");
@@ -143,8 +139,9 @@ export default function App() {
   const acceptedWatchdog = useRef<number | null>(null);
   const errorTimer = useRef<number | null>(null);
   const errorToken = useRef(0);
-  const conversationId = useRef(uid());
-  const meldivoRoom = useRef<MeldivoRoomCredentials | null>(readMeldivoRoomCredentials());
+  const conversationId = useRef(getConversationId(sessionKey));
+  const liveKey = useRef(sessionKey);
+  const harnessRef = useRef<HarnessId | undefined>(deriveSessionDisplay(sessionKey).harness);
   const generation = useRef(0);
   const outputFrame = useRef(0);
   const meterOwner = useRef<symbol | null>(null);
@@ -160,8 +157,9 @@ export default function App() {
   const [selectedVoice, setSelectedVoice] = useState(() => readVoicePreference() ?? "");
   const [savedVoice, setSavedVoice] = useState(() => readVoicePreference() ?? "");
   const [speechHealth, setSpeechHealth] = useState<SpeechHealth>({ ready: true, downloading: false });
-  const [connectedRoom, setConnectedRoom] = useState<MeldivoRoom | null>(null);
-  const [roomConnectionError, setRoomConnectionError] = useState("");
+  const [sessionDisplay, setSessionDisplay] = useState<SessionDisplay>(() => deriveSessionDisplay(sessionKey));
+  const [unauthorized, setUnauthorized] = useState(false);
+  const [statusText, setStatusText] = useState("");
   const [voiceCatalogWarning, setVoiceCatalogWarning] = useState("");
   const [voiceLoading, setVoiceLoading] = useState(false);
   const [voiceError, setVoiceError] = useState("");
@@ -180,8 +178,6 @@ export default function App() {
   const previewPlayback = useRef<PreparedSpeech | null>(null);
   const settingsOpenRef = useRef(false);
   const settingsMicPaused = useRef(false);
-
-  const roomAuthHeaders = (): Record<string, string> => meldivoRoom.current ? { "X-Meldivo-Room-Token": meldivoRoom.current.token } : {};
 
   const clearAcceptedWatchdog = () => {
     if (acceptedWatchdog.current !== null) window.clearTimeout(acceptedWatchdog.current);
@@ -253,11 +249,17 @@ export default function App() {
   };
   const abortTurn = () => {
     generation.current++;
+    const wasActive = harnessTurnActive.current || Boolean(chat.current);
     harnessTurnActive.current = false;
     chat.current?.abort();
     chat.current = null;
     pipeline.current?.cancel();
     stopMeter();
+    if (wasActive) {
+      void fetch(`/api/sessions/${encodeURIComponent(liveKey.current)}/cancel`, {
+        method: "POST", headers: authHeaders(),
+      }).catch(() => undefined);
+    }
     if (!muted.current && started.current) updateState("listening");
   };
   const interruptActiveTurn = () => {
@@ -333,7 +335,7 @@ export default function App() {
 
   const transcribe = async (samples: Float32Array, signal: AbortSignal) => {
     const response = await fetch("/api/voice/transcribe", {
-      method: "POST", headers: { "Content-Type": "audio/wav", ...roomAuthHeaders() }, body: samplesWav(samples), signal,
+      method: "POST", headers: { "Content-Type": "audio/wav", ...authHeaders() }, body: samplesWav(samples), signal,
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error ?? "Transcription failed.");
@@ -349,7 +351,7 @@ export default function App() {
       startMeter(analyser, playback);
     };
     const response = await fetch("/api/voice/speech", {
-      method: "POST", headers: { "Content-Type": "application/json", Accept: "audio/wav", ...roomAuthHeaders() },
+      method: "POST", headers: { "Content-Type": "application/json", Accept: "audio/wav", ...authHeaders() },
       body: JSON.stringify({
         text,
         ...(turnVoice.current ? { voice: turnVoice.current } : {}),
@@ -441,7 +443,7 @@ export default function App() {
       await context.resume();
       const response = await fetch("/api/voice/speech", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "audio/wav", ...roomAuthHeaders() },
+        headers: { "Content-Type": "application/json", Accept: "audio/wav", ...authHeaders() },
         body: JSON.stringify({ text: previewText, voice: selectedVoice }),
         signal: controller.signal,
       });
@@ -476,7 +478,7 @@ export default function App() {
     setVoiceLoading(true);
     setVoiceError("");
     setVoiceCatalogWarning("");
-    void fetch("/api/voice/voices", { headers: roomAuthHeaders(), signal: controller.signal })
+    void fetch("/api/voice/voices", { headers: authHeaders(), signal: controller.signal })
       .then(async (response) => {
         const result = await response.json() as VoiceListResponse;
         if (!response.ok) throw new Error(typeof result.current === "string" ? result.current : "Could not load voices.");
@@ -572,6 +574,26 @@ export default function App() {
     }
   };
 
+  const applySessionEvent = (id: string) => {
+    const knownHarness = harnessRef.current;
+    if (knownHarness) {
+      liveKey.current = `${knownHarness}:${id}`;
+      return;
+    }
+    void fetch("/api/sessions", { headers: authHeaders() })
+      .then(checkAuthorized)
+      .then(async (response) => {
+        if (!response.ok) return;
+        const result = await response.json() as SessionsResponse;
+        const match = result.sessions.find((session) => session.id === id);
+        if (!match) return;
+        liveKey.current = match.key;
+        harnessRef.current = match.harness;
+        if (mounted.current) setSessionDisplay({ harness: match.harness, title: match.title, cwd: match.cwd });
+      })
+      .catch(() => undefined);
+  };
+
   const sendMessage = async (message: string) => {
     const id = ++generation.current;
     let spoken = false;
@@ -583,39 +605,54 @@ export default function App() {
       if (!message || id !== generation.current) { syncState(); return; }
       assistantAudio.current = "";
       turnVoice.current = readVoicePreference();
-      const response = await fetch("/api/chat", {
-        method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...roomAuthHeaders() },
-        body: JSON.stringify({
-          conversationId: conversationId.current,
-          message,
-          ...(meldivoRoom.current ? { roomId: meldivoRoom.current.id, roomToken: meldivoRoom.current.token } : {}),
-        }), signal: controller.signal,
+      const response = await fetch(`/api/sessions/${encodeURIComponent(liveKey.current)}/chat`, {
+        method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...authHeaders() },
+        body: JSON.stringify({ conversationId: conversationId.current, message }), signal: controller.signal,
       });
+      checkAuthorized(response);
       if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? "Chat request failed.");
       let pending = "";
-      let spoken = false;
-      await streamDeltas(
-        response,
-        (delta) => {
-          if (id !== generation.current) return;
-          if (harnessTurnActive.current) {
-            harnessTurnActive.current = false;
-            updateState("thinking");
+      await streamTurnEvents(response, (event) => {
+        if (id !== generation.current) return;
+        switch (event.type) {
+          case "session":
+            applySessionEvent(event.id);
+            return;
+          case "status":
+            harnessTurnActive.current = true;
+            updateState("running");
+            setStatusText(event.message);
+            return;
+          case "tool":
+            harnessTurnActive.current = true;
+            updateState("running");
+            setStatusText(`Using ${event.name}…`);
+            return;
+          case "delta": {
+            if (harnessTurnActive.current) {
+              harnessTurnActive.current = false;
+              updateState("thinking");
+            }
+            pending += event.text;
+            const result = consumeSpeechChunks(pending);
+            pending = result.rest;
+            if (result.chunks.length) {
+              spoken = true;
+              pipeline.current?.enqueue(result.chunks);
+            }
+            return;
           }
-          pending += delta;
-          const result = consumeSpeechChunks(pending);
-          pending = result.rest;
-          if (result.chunks.length) {
+          case "notice":
+            setStatusText(event.message);
             spoken = true;
-            pipeline.current?.enqueue(result.chunks);
-          }
-        },
-        () => {
-          if (id !== generation.current) return;
-          harnessTurnActive.current = true;
-          updateState("running");
-        },
-      );
+            pipeline.current?.enqueue([event.message]);
+            return;
+          case "error":
+            throw new Error(event.message);
+          case "done":
+            return;
+        }
+      });
       if (id === generation.current) {
         const final = consumeSpeechChunks(pending, true);
         if (final.chunks.length) {
@@ -624,6 +661,10 @@ export default function App() {
         }
       }
     } catch (caught) {
+      if (caught instanceof UnauthorizedError) {
+        if (mounted.current) setUnauthorized(true);
+        return;
+      }
       if (!(caught instanceof DOMException && caught.name === "AbortError") && id === generation.current) {
         report(caught instanceof Error ? caught.message : "Voice conversation failed.");
         // A turn that dies before any audio is spoken must still produce a spoken reply,
@@ -633,6 +674,7 @@ export default function App() {
     } finally {
       if (chat.current === controller) chat.current = null;
       harnessTurnActive.current = false;
+      if (mounted.current) setStatusText("");
       syncState();
     }
   };
@@ -960,22 +1002,23 @@ export default function App() {
   };
 
   useEffect(() => {
-    const credentials = meldivoRoom.current;
-    if (!credentials) return;
     const controller = new AbortController();
-    void fetch(`/api/rooms/${encodeURIComponent(credentials.id)}`, {
-      headers: { "X-Meldivo-Room-Token": credentials.token }, signal: controller.signal,
-    }).then(async (response) => {
-      const result = await response.json().catch(() => ({})) as { room?: MeldivoRoom; error?: string };
-      if (!response.ok || !result.room) throw new Error(result.error || "Could not connect to this room.");
-      if (!controller.signal.aborted) setConnectedRoom(result.room);
-    }).catch((caught) => {
-      if (!(caught instanceof DOMException && caught.name === "AbortError") && !controller.signal.aborted) {
-        setRoomConnectionError(caught instanceof Error ? caught.message : "Could not connect to this room.");
-      }
-    });
+    void fetch("/api/sessions", { headers: authHeaders(), signal: controller.signal })
+      .then(checkAuthorized)
+      .then(async (response) => {
+        if (!response.ok) return;
+        const result = await response.json() as SessionsResponse;
+        const match = result.sessions.find((session) => session.key === sessionKey);
+        if (match && !controller.signal.aborted) {
+          harnessRef.current = match.harness;
+          setSessionDisplay({ harness: match.harness, title: match.title, cwd: match.cwd });
+        }
+      })
+      .catch((caught) => {
+        if (caught instanceof UnauthorizedError && !controller.signal.aborted) setUnauthorized(true);
+      });
     return () => controller.abort();
-  }, []);
+  }, [sessionKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1073,6 +1116,8 @@ export default function App() {
     releaseOwnership();
   }, []);
 
+  if (unauthorized) return <UnauthorizedScreen />;
+
   const label = !started.current ? "Start voice conversation" : state === "muted" ? "Unmute microphone" : "Mute microphone";
   const contextLeft = contextMenu ? Math.max(12, Math.min(contextMenu.x, window.innerWidth - 170)) : 0;
   const contextTop = contextMenu ? Math.max(12, Math.min(contextMenu.y, window.innerHeight - 68)) : 0;
@@ -1084,13 +1129,14 @@ export default function App() {
       ? `Downloading voice models…${typeof speechHealth.progress === "number" ? ` ${Math.round(speechHealth.progress)}%` : ""}`
       : "Offline";
   return <main className="voice-page" data-state={state} style={{ "--level": level } as CSSProperties}>
-    {meldivoRoom.current && <p className={`voice-room-indicator${roomConnectionError ? " voice-room-indicator--error" : ""}`} role="status">
-      {roomConnectionError
-        ? "Room unavailable"
-        : connectedRoom
-          ? "Connected to Pi"
-          : "Connecting…"}
-    </p>}
+    <header className="room-header">
+      <a className="room-header__back" href="/" aria-label="Back to hub">←</a>
+      <span className="room-header__title">
+        {sessionDisplay.harness ? harnessLabel[sessionDisplay.harness] : "Meldivo"} · {sessionDisplay.title}
+      </span>
+      {sessionDisplay.cwd && <span className="room-header__cwd">{sessionDisplay.cwd}</span>}
+    </header>
+    {statusText && <p className="room-status" role="status">{statusText}</p>}
     {!speechHealth.ready && <p className="voice-health" role="status">
       {speechHealth.error || speechStatusLabel}
     </p>}

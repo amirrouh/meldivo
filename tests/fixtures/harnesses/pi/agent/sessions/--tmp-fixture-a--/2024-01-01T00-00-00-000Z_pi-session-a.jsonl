@@ -1,0 +1,4 @@
+{"type":"session","version":3,"id":"pi-session-a","timestamp":"2024-01-01T00:00:00.000Z","cwd":"/tmp/fixture-a"}
+{"type":"model_change","id":"m1","parentId":null,"timestamp":"2024-01-01T00:00:01.000Z","provider":"anthropic","modelId":"claude-sonnet-4-5"}
+{"type":"message","id":"u1","parentId":"m1","timestamp":"2024-01-01T00:00:02.000Z","message":{"role":"user","content":"Refactor the parser","timestamp":1704067202000}}
+{"type":"session_info","id":"s1","parentId":"u1","timestamp":"2024-01-01T00:00:03.000Z","name":"Refactor parser session"}

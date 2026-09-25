@@ -26,6 +26,47 @@ function fakeSpeechEngine() {
   };
 }
 
+// A fake adapter driven by a queue of canned `send()` generators, so each
+// test can script exactly what a turn does without a real CLI.
+function fakeAdapter(id, label, { available = true, sessions = [] } = {}) {
+  const sendQueue = [];
+  return {
+    id,
+    label,
+    sessions,
+    calls: [],
+    async available() {
+      return available;
+    },
+    async listSessions(limit) {
+      void limit;
+      return sessions;
+    },
+    queueSend(genFactory) {
+      sendQueue.push(genFactory);
+    },
+    async *send(target, text, signal) {
+      this.calls.push({ target, text });
+      const factory = sendQueue.shift();
+      if (!factory) {
+        yield { type: "error", message: `${label}: no scripted response` };
+        return;
+      }
+      yield* factory(target, text, signal);
+    },
+  };
+}
+
+async function* okTurn(sessionId, deltas) {
+  yield { type: "session", id: sessionId };
+  for (const text of deltas) yield { type: "delta", text };
+  yield { type: "done" };
+}
+
+async function* erroringTurn(message) {
+  yield { type: "error", message };
+}
+
 function httpsGet(url) {
   return new Promise((resolve, reject) => {
     https
@@ -60,119 +101,286 @@ async function readSseEvents(response, minCount, timeoutMs = 5_000) {
   return events;
 }
 
-test("Meldivo hub: auth, room lifecycle, harness chat, and voice endpoints", { timeout: 15_000 }, async (t) => {
+// Like readSseEvents, but waits for the turn's terminal event ("done" or
+// "error") rather than a fixed count, since callers that depend on
+// server-side bookkeeping finishing (the busy-lock, a saved fork id) before
+// making their next request need to know the turn is actually over.
+async function readSseUntilDone(response, timeoutMs = 5_000) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  const events = [];
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffered += decoder.decode(value, { stream: true });
+    let boundary;
+    while ((boundary = buffered.indexOf("\n\n")) !== -1) {
+      const chunk = buffered.slice(0, boundary);
+      buffered = buffered.slice(boundary + 2);
+      const line = chunk.split("\n").find((entry) => entry.startsWith("data:"));
+      if (line) events.push(JSON.parse(line.slice(5).trim()));
+    }
+    if (events.some((event) => event.type === "done" || event.type === "error")) break;
+  }
+  await reader.cancel().catch(() => undefined);
+  return events;
+}
+
+function tmpStateDir() {
+  return mkdtempSync(path.join(tmpdir(), "meldivo-state-"));
+}
+
+test("Meldivo hub: auth and /api/sessions shape", async (t) => {
+  const secret = "s".repeat(32);
+  const pi = fakeAdapter("pi", "Pi");
+  const opencode = fakeAdapter("opencode", "OpenCode");
+  const claude = fakeAdapter("claude", "Claude Code", {
+    sessions: [{ key: "claude:abc", harness: "claude", id: "abc", title: "Fix bug", cwd: "/work", updatedAt: 1, open: false }],
+  });
+  const server = await startServer({
+    port: 0,
+    secret,
+    speech: fakeSpeechEngine(),
+    webDir: "/does/not/exist",
+    adapters: [pi, opencode, claude],
+    stateDir: tmpStateDir(),
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.port}`;
+
+  await t.test("health is unauthenticated", async () => {
+    const response = await fetch(`${base}/api/health`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+  });
+
+  await t.test("every other route requires the bearer secret", async () => {
+    const response = await fetch(`${base}/api/sessions`);
+    assert.equal(response.status, 401);
+  });
+
+  await t.test("rejects a wrong secret too", async () => {
+    const response = await fetch(`${base}/api/sessions`, { headers: { authorization: "Bearer wrong" } });
+    assert.equal(response.status, 401);
+  });
+
+  await t.test("lists sessions and harness availability", async () => {
+    const response = await fetch(`${base}/api/sessions`, { headers: { authorization: `Bearer ${secret}` } });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(typeof body.machine, "string");
+    assert.deepEqual(
+      body.harnesses.map((h) => h.id),
+      ["pi", "opencode", "claude"],
+    );
+    assert.ok(body.harnesses.every((h) => h.available === true));
+    assert.equal(body.sessions.length, 1);
+    assert.equal(body.sessions[0].key, "claude:abc");
+  });
+});
+
+test("Meldivo hub: chat over an existing closed session continues it directly", async (t) => {
+  const secret = "s".repeat(32);
+  const claude = fakeAdapter("claude", "Claude Code", {
+    sessions: [{ key: "claude:abc", harness: "claude", id: "abc", title: "Fix bug", cwd: "/work", updatedAt: 1, open: false, model: "sonnet" }],
+  });
+  claude.queueSend(() => okTurn("abc", ["Sure, ", "looking now."]));
+  const server = await startServer({
+    port: 0,
+    secret,
+    speech: fakeSpeechEngine(),
+    webDir: "/does/not/exist",
+    adapters: [fakeAdapter("pi", "Pi"), fakeAdapter("opencode", "OpenCode"), claude],
+    stateDir: tmpStateDir(),
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.port}`;
+
+  const response = await fetch(`${base}/api/sessions/claude:abc/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ message: "what does this do?" }),
+  });
+  assert.equal(response.status, 200);
+  const events = await readSseEvents(response, 3);
+  assert.ok(events.some((e) => e.type === "delta" && e.text === "Sure, "));
+  assert.ok(events.some((e) => e.type === "done"));
+  assert.equal(claude.calls.length, 1);
+  assert.equal(claude.calls[0].target.id, "abc");
+  assert.equal(claude.calls[0].target.fork, false);
+  assert.equal(claude.calls[0].target.cwd, "/work");
+  assert.equal(claude.calls[0].target.model, "sonnet");
+});
+
+test("Meldivo hub: chat over an open session forks on the first turn, then continues the fork", async (t) => {
+  const secret = "s".repeat(32);
+  const claude = fakeAdapter("claude", "Claude Code", {
+    sessions: [{ key: "claude:abc", harness: "claude", id: "abc", title: "Fix bug", cwd: "/work", updatedAt: 1, open: true }],
+  });
+  claude.queueSend(() => okTurn("fork-1", ["first "]));
+  claude.queueSend(() => okTurn("fork-1", ["second "]));
+  const server = await startServer({
+    port: 0,
+    secret,
+    speech: fakeSpeechEngine(),
+    webDir: "/does/not/exist",
+    adapters: [fakeAdapter("pi", "Pi"), fakeAdapter("opencode", "OpenCode"), claude],
+    stateDir: tmpStateDir(),
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.port}`;
+
+  const first = await fetch(`${base}/api/sessions/claude:abc/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ message: "hi" }),
+  });
+  await readSseUntilDone(first);
+  assert.equal(claude.calls[0].target.id, "abc");
+  assert.equal(claude.calls[0].target.fork, true);
+
+  const second = await fetch(`${base}/api/sessions/claude:abc/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ message: "again" }),
+  });
+  await readSseEvents(second, 2);
+  assert.equal(claude.calls[1].target.id, "fork-1");
+  assert.equal(claude.calls[1].target.fork, false);
+});
+
+test("Meldivo hub: new:<harness> creates then continues a session by conversationId", async (t) => {
+  const secret = "s".repeat(32);
+  const claude = fakeAdapter("claude", "Claude Code");
+  claude.queueSend(() => okTurn("new-session-1", ["hello"]));
+  claude.queueSend(() => okTurn("new-session-1", ["again"]));
+  const server = await startServer({
+    port: 0,
+    secret,
+    speech: fakeSpeechEngine(),
+    webDir: "/does/not/exist",
+    adapters: [fakeAdapter("pi", "Pi"), fakeAdapter("opencode", "OpenCode"), claude],
+    stateDir: tmpStateDir(),
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.port}`;
+
+  const first = await fetch(`${base}/api/sessions/new:claude/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ message: "start", conversationId: "conv-1" }),
+  });
+  await readSseUntilDone(first);
+  assert.equal(claude.calls[0].target.id, null);
+  assert.equal(claude.calls[0].target.fork, false);
+
+  const second = await fetch(`${base}/api/sessions/new:claude/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ message: "continue", conversationId: "conv-1" }),
+  });
+  await readSseEvents(second, 2);
+  assert.equal(claude.calls[1].target.id, "new-session-1");
+});
+
+test("Meldivo hub: quick falls back to the next available harness on error", async (t) => {
+  const secret = "s".repeat(32);
+  const pi = fakeAdapter("pi", "Pi", { available: false });
+  const opencode = fakeAdapter("opencode", "OpenCode");
+  opencode.queueSend(() => erroringTurn("OpenCode is not logged in"));
+  const claude = fakeAdapter("claude", "Claude Code");
+  claude.queueSend(() => okTurn("quick-1", ["all good"]));
+  const server = await startServer({
+    port: 0,
+    secret,
+    speech: fakeSpeechEngine(),
+    webDir: "/does/not/exist",
+    adapters: [pi, opencode, claude],
+    stateDir: tmpStateDir(),
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.port}`;
+
+  const response = await fetch(`${base}/api/sessions/quick/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ message: "hi", conversationId: "conv-quick" }),
+  });
+  assert.equal(response.status, 200);
+  const events = await readSseEvents(response, 3);
+  assert.ok(events.some((e) => e.type === "status" && /unavailable, using/i.test(e.message)));
+  assert.ok(events.some((e) => e.type === "delta" && e.text === "all good"));
+  assert.equal(opencode.calls.length, 1);
+  assert.equal(claude.calls.length, 1);
+});
+
+test("Meldivo hub: cancel aborts a running turn, and one turn at a time per key", async (t) => {
+  const secret = "s".repeat(32);
+  const claude = fakeAdapter("claude", "Claude Code");
+  claude.queueSend(async function* (target, text, signal) {
+    yield { type: "session", id: "s1" };
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, 5_000);
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(new DOMException("aborted", "AbortError"));
+      });
+    });
+    yield { type: "done" };
+  });
+  const server = await startServer({
+    port: 0,
+    secret,
+    speech: fakeSpeechEngine(),
+    webDir: "/does/not/exist",
+    adapters: [fakeAdapter("pi", "Pi"), fakeAdapter("opencode", "OpenCode"), claude],
+    stateDir: tmpStateDir(),
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.port}`;
+
+  const chatPromise = fetch(`${base}/api/sessions/new:claude/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ message: "hi", conversationId: "conv-cancel" }),
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const busy = await fetch(`${base}/api/sessions/new:claude/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ message: "again" }),
+  });
+  assert.equal(busy.status, 409);
+
+  const cancel = await fetch(`${base}/api/sessions/new:claude/cancel`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${secret}` },
+  });
+  assert.equal(cancel.status, 204);
+
+  const response = await chatPromise;
+  assert.equal(response.status, 200);
+  await response.body?.cancel().catch(() => undefined);
+});
+
+test("Meldivo hub: voice endpoints", async (t) => {
   const secret = "s".repeat(32);
   const server = await startServer({
     port: 0,
     secret,
     speech: fakeSpeechEngine(),
     webDir: "/does/not/exist",
-    idleShutdownMs: 0,
+    adapters: [fakeAdapter("pi", "Pi"), fakeAdapter("opencode", "OpenCode"), fakeAdapter("claude", "Claude Code")],
+    stateDir: tmpStateDir(),
   });
   t.after(() => server.close());
   const base = `http://127.0.0.1:${server.port}`;
 
-  await t.test("rejects room creation without the secret", async () => {
-    const response = await fetch(`${base}/api/rooms`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ mode: "harness", harness: "pi" }),
-    });
-    assert.equal(response.status, 401);
-  });
-
-  await t.test("rejects a wrong secret too", async () => {
-    const response = await fetch(`${base}/api/rooms`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-meldivo-secret": "wrong" },
-      body: JSON.stringify({ mode: "harness", harness: "pi" }),
-    });
-    assert.equal(response.status, 401);
-  });
-
-  let room;
-  await t.test("creates a room with the secret", async () => {
-    const response = await fetch(`${base}/api/rooms`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-meldivo-secret": secret },
-      body: JSON.stringify({ mode: "harness", harness: "pi", cwd: "/work/project", label: "my session" }),
-    });
-    assert.equal(response.status, 201);
-    room = await response.json();
-    assert.equal(room.room.mode, "harness");
-    assert.equal(room.room.harness, "pi");
-    assert.equal(room.room.cwd, "/work/project");
-    assert.ok(room.token && room.token.length >= 32);
-    assert.match(room.url, new RegExp(`\\?room=${room.room.id}#token=${room.token}`));
-  });
-
-  await t.test("adapter next/events round trip into the /api/chat SSE stream", async () => {
-    const chatResponse = await fetch(`${base}/api/chat`, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "text/event-stream" },
-      body: JSON.stringify({
-        conversationId: "conv-1",
-        message: "what does this function do?",
-        roomId: room.room.id,
-        roomToken: room.token,
-      }),
-    });
-    assert.equal(chatResponse.status, 200);
-
-    let turn;
-    for (let attempt = 0; attempt < 20 && !turn; attempt++) {
-      const next = await fetch(`${base}/api/rooms/${room.room.id}/adapter/next`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${room.token}` },
-      });
-      if (next.status === 200) turn = await next.json();
-      else await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    assert.ok(turn, "the adapter should have received the queued turn");
-    assert.equal(turn.message, "what does this function do?");
-    assert.equal(turn.harness, "pi");
-    assert.equal(turn.cwd, "/work/project");
-
-    const deltaResponse = await fetch(`${base}/api/rooms/${room.room.id}/adapter/events`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${room.token}` },
-      body: JSON.stringify({ turnId: turn.turnId, type: "delta", text: "It reverses the list." }),
-    });
-    assert.equal(deltaResponse.status, 202);
-
-    const doneResponse = await fetch(`${base}/api/rooms/${room.room.id}/adapter/events`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${room.token}` },
-      body: JSON.stringify({ turnId: turn.turnId, type: "done" }),
-    });
-    assert.equal(doneResponse.status, 202);
-
-    const events = await readSseEvents(chatResponse, 3);
-    assert.equal(events[0]?.type, "status");
-    assert.ok(events.some((event) => event.type === "delta" && event.text === "It reverses the list."));
-    assert.ok(events.some((event) => event.type === "done"));
-  });
-
-  await t.test("adapter endpoints reject the wrong room token", async () => {
-    const response = await fetch(`${base}/api/rooms/${room.room.id}/adapter/next`, {
-      method: "POST",
-      headers: { authorization: "Bearer " + "x".repeat(32) },
-    });
-    assert.equal(response.status, 401);
-  });
-
-  await t.test("transcribes audio through the fake speech engine", async () => {
-    const wav = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(40)]);
-    const response = await fetch(`${base}/api/voice/transcribe`, {
-      method: "POST",
-      headers: { "content-type": "audio/wav", authorization: `Bearer ${room.token}` },
-      body: wav,
-    });
-    assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { text: "hello from fake stt" });
-  });
-
-  await t.test("rejects transcription without a valid room token", async () => {
+  await t.test("rejects transcription without the secret", async () => {
     const wav = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(40)]);
     const response = await fetch(`${base}/api/voice/transcribe`, {
       method: "POST",
@@ -182,10 +390,21 @@ test("Meldivo hub: auth, room lifecycle, harness chat, and voice endpoints", { t
     assert.equal(response.status, 401);
   });
 
+  await t.test("transcribes audio through the fake speech engine", async () => {
+    const wav = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(40)]);
+    const response = await fetch(`${base}/api/voice/transcribe`, {
+      method: "POST",
+      headers: { "content-type": "audio/wav", authorization: `Bearer ${secret}` },
+      body: wav,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { text: "hello from fake stt" });
+  });
+
   await t.test("synthesizes speech through the fake speech engine", async () => {
     const response = await fetch(`${base}/api/voice/speech`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${room.token}` },
+      headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
       body: JSON.stringify({ text: "hello there" }),
     });
     assert.equal(response.status, 200);
@@ -196,26 +415,43 @@ test("Meldivo hub: auth, room lifecycle, harness chat, and voice endpoints", { t
 
   await t.test("lists voices through the fake speech engine", async () => {
     const response = await fetch(`${base}/api/voice/voices`, {
-      headers: { authorization: `Bearer ${room.token}` },
+      headers: { authorization: `Bearer ${secret}` },
     });
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { current: "voice-a", voices: ["voice-a", "voice-b"] });
   });
 
-  await t.test("closes the room with the secret and the room no longer authorizes", async () => {
-    const response = await fetch(`${base}/api/rooms/${room.room.id}`, {
+  await t.test("voice lease claim/heartbeat/release round trip", async () => {
+    const claim = await fetch(`${base}/api/voice/lease`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${secret}` },
+    });
+    assert.equal(claim.status, 201);
+    const lease = await claim.json();
+
+    const conflict = await fetch(`${base}/api/voice/lease`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${secret}` },
+    });
+    assert.equal(conflict.status, 409);
+
+    const heartbeat = await fetch(`${base}/api/voice/lease/heartbeat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+      body: JSON.stringify({ token: lease.token }),
+    });
+    assert.equal(heartbeat.status, 200);
+
+    const release = await fetch(`${base}/api/voice/lease`, {
       method: "DELETE",
-      headers: { "x-meldivo-secret": secret },
+      headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+      body: JSON.stringify({ token: lease.token }),
     });
-    assert.equal(response.status, 204);
-    const after = await fetch(`${base}/api/rooms/${room.room.id}`, {
-      headers: { authorization: `Bearer ${room.token}` },
-    });
-    assert.equal(after.status, 401);
+    assert.equal(release.status, 204);
   });
 });
 
-test("Meldivo remote HTTPS listener: secret-gated, backed by a user-supplied certificate", { timeout: 20_000 }, async (t) => {
+test("Meldivo remote: 401 without secret, and the certificate path serves HTTPS via a user-supplied cert", async (t) => {
   const configHome = mkdtempSync(path.join(tmpdir(), "meldivo-tls-"));
   const tlsDir = path.join(configHome, "meldivo", "tls");
   mkdirSync(tlsDir, { recursive: true });
@@ -234,30 +470,38 @@ test("Meldivo remote HTTPS listener: secret-gated, backed by a user-supplied cer
   });
 
   const secret = "r".repeat(32);
-  const server = await startServer({ port: 0, secret, speech: fakeSpeechEngine(), webDir: "/does/not/exist", idleShutdownMs: 0, httpsPort: 0 });
+  const server = await startServer({
+    port: 0,
+    secret,
+    speech: fakeSpeechEngine(),
+    webDir: "/does/not/exist",
+    adapters: [fakeAdapter("pi", "Pi"), fakeAdapter("opencode", "OpenCode"), fakeAdapter("claude", "Claude Code")],
+    stateDir: tmpStateDir(),
+    httpsPort: 0,
+  });
   t.after(() => server.close());
   const base = `http://127.0.0.1:${server.port}`;
 
-  await t.test("rejects enabling HTTPS without the secret", async () => {
-    const response = await fetch(`${base}/api/remote/https`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ enable: true }),
-    });
+  await t.test("rejects GET /api/remote without the secret", async () => {
+    const response = await fetch(`${base}/api/remote`);
     assert.equal(response.status, 401);
   });
 
   let httpsPort;
-  await t.test("enables the HTTPS listener with the secret", async () => {
-    const response = await fetch(`${base}/api/remote/https`, {
+  await t.test("enables the certificate option and reports it as active", async () => {
+    const response = await fetch(`${base}/api/remote`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-meldivo-secret": secret },
-      body: JSON.stringify({ enable: true }),
+      headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+      body: JSON.stringify({ id: "certificate" }),
     });
     assert.equal(response.status, 200);
-    const payload = await response.json();
-    assert.ok(Number.isInteger(payload.port) && payload.port > 0);
-    httpsPort = payload.port;
+    const body = await response.json();
+    assert.match(body.url, /^https:\/\//);
+    httpsPort = new URL(body.url).port;
+
+    const status = await fetch(`${base}/api/remote`, { headers: { authorization: `Bearer ${secret}` } });
+    const statusBody = await status.json();
+    assert.equal(statusBody.active.id, "certificate");
   });
 
   await t.test("serves /api/health over HTTPS using the certificate", async () => {
@@ -266,13 +510,12 @@ test("Meldivo remote HTTPS listener: secret-gated, backed by a user-supplied cer
     assert.equal(JSON.parse(response.body).ok, true);
   });
 
-  await t.test("disables the HTTPS listener with the secret and it stops serving", async () => {
-    const response = await fetch(`${base}/api/remote/https`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-meldivo-secret": secret },
-      body: JSON.stringify({ enable: false }),
+  await t.test("turns remote access off", async () => {
+    const response = await fetch(`${base}/api/remote`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${secret}` },
     });
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 204);
     await assert.rejects(() => httpsGet(`https://127.0.0.1:${httpsPort}/api/health`));
   });
 });

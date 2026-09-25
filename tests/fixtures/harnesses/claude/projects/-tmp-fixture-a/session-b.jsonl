@@ -1,0 +1,4 @@
+{"parentUuid":null,"isSidechain":false,"isMeta":true,"type":"user","message":{"role":"user","content":[{"type":"text","text":"This meta line should be skipped as a title candidate"}]},"cwd":"/tmp/fixture-a","sessionId":"session-b-id"}
+{"parentUuid":"u1","isSidechain":false,"type":"user","message":{"role":"user","content":"<command-name>ignored</command-name>"},"cwd":"/tmp/fixture-a","sessionId":"session-b-id"}
+{"parentUuid":"u2","isSidechain":false,"type":"user","message":{"role":"user","content":"What does this function do?"},"cwd":"/tmp/fixture-a","sessionId":"session-b-id"}
+{"parentUuid":"u3","isSidechain":false,"type":"assistant","message":{"model":"claude-opus-4","content":[{"type":"text","text":"It parses the config file."}]},"cwd":"/tmp/fixture-a","sessionId":"session-b-id"}

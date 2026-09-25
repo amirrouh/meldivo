@@ -1,8 +1,12 @@
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import Hub from "./Hub";
+import { initAuth } from "./auth";
 import "./index.css";
 
-const hasRoom = new URLSearchParams(window.location.search).has("room");
+initAuth();
+
+const sessionKey = new URLSearchParams(window.location.search).get("session");
 createRoot(document.getElementById("root")!).render(
-  hasRoom ? <App /> : <p className="no-room-message">Open the link printed by /meldivo in Pi.</p>,
+  sessionKey ? <App sessionKey={sessionKey} /> : <Hub />,
 );

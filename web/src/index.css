@@ -12,11 +12,12 @@ button { font: inherit; }
 .voice-error span { overflow-wrap: anywhere; }
 .voice-error__reconnect { flex: none; padding: 5px 9px; border: 1px solid rgb(255 178 183 / .32); border-radius: 999px; color: inherit; background: rgb(255 255 255 / .08); cursor: pointer; font-size: 11px; }
 .voice-error__reconnect:hover, .voice-error__reconnect:focus-visible { background: rgb(255 255 255 / .17); outline: none; }
-.voice-room-indicator { position: fixed; z-index: 3; top: 18px; left: 50%; margin: 0; padding: 5px 10px; transform: translateX(-50%); border: 1px solid rgb(128 232 189 / .28); border-radius: 999px; background: rgb(12 27 23 / .78); color: rgb(171 241 205); font-size: 11px; white-space: nowrap; }
-.voice-room-indicator--error { border-color: rgb(255 178 183 / .3); background: rgb(39 16 22 / .82); color: rgb(255 203 208); }
-.voice-permissions { position: fixed; z-index: 7; right: 16px; bottom: 16px; display: grid; gap: 8px; width: min(340px, calc(100vw - 32px)); }
-.voice-permission { padding: 12px; border: 1px solid rgb(255 205 123 / .38); border-radius: 12px; background: rgb(42 31 13 / .96); box-shadow: 0 12px 36px rgb(0 0 0 / .35); color: rgb(255 238 199); font-size: 12px; line-height: 1.4; }
-.voice-permission p { margin: 0 0 4px; font-weight: 650; }.voice-permission span { color: rgb(255 238 199 / .84); }.voice-permission div { display: flex; justify-content: flex-end; gap: 7px; margin-top: 10px; }.voice-permission button { padding: 6px 10px; border: 1px solid rgb(255 238 199 / .25); border-radius: 7px; color: inherit; background: rgb(255 255 255 / .08); cursor: pointer; font-size: 11px; }.voice-permission button:last-child { border-color: rgb(128 232 189 / .45); background: rgb(37 122 82 / .28); }.voice-permission button:disabled { cursor: default; opacity: .55; }
+.room-header { position: fixed; z-index: 3; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 10px; padding: 14px 16px; color: rgb(224 228 238 / .85); font-size: 13px; }
+.room-header__back { flex: none; color: inherit; text-decoration: none; font-size: 18px; line-height: 1; }
+.room-header__back:hover, .room-header__back:focus-visible { color: #fff; outline: none; }
+.room-header__title { font-weight: 600; }
+.room-header__cwd { color: rgb(208 214 228 / .55); font-size: 11px; }
+.room-status { position: fixed; z-index: 3; top: 88px; left: 50%; margin: 0; padding: 5px 10px; transform: translateX(-50%); border: 1px solid rgb(255 255 255 / .12); border-radius: 999px; background: rgb(13 15 21 / .8); color: rgb(208 214 228 / .82); font-size: 11px; white-space: nowrap; }
 @keyframes orbit-one { to { rotate: 1turn; } } @keyframes orbit-two { to { rotate: 1turn; } } @keyframes breathe { 50% { scale: 1.08; filter: brightness(1.15); } } @keyframes shake { 25% { translate: -7px; } 75% { translate: 7px; } } @media (prefers-reduced-motion: reduce) { .voice-shape *, .voice-page::before, .voice-page::after { animation: none !important; transition-duration: .01ms !important; } }
 
 .voice-context-menu, .voice-settings { position: fixed; z-index: 5; border: 1px solid rgb(255 255 255 / .14); border-radius: 12px; background: rgb(13 15 21 / .96); box-shadow: 0 12px 36px rgb(0 0 0 / .35); color: rgb(240 243 250); backdrop-filter: blur(16px); }
@@ -69,5 +70,52 @@ button { font: inherit; }
 .voice-onboarding__card p { margin: 10px 0 18px; color: rgb(208 214 228 / .76); font-size: 13px; line-height: 1.45; }
 .voice-onboarding__card button { min-width: 90px; padding: 8px 14px; border: 1px solid rgb(var(--color) / .5); border-radius: 8px; color: inherit; background: rgb(var(--color) / .17); cursor: pointer; }
 .voice-onboarding__card button:hover, .voice-onboarding__card button:focus-visible { background: rgb(255 255 255 / .15); outline: none; }
-.no-room-message { display: grid; place-items: center; min-height: 100vh; margin: 0; padding: 24px; color: rgb(208 214 228 / .8); font-size: 14px; text-align: center; background: #050609; }
-.voice-health { position: fixed; z-index: 3; top: 42px; left: 50%; margin: 0; padding: 5px 10px; transform: translateX(-50%); border: 1px solid rgb(255 205 123 / .3); border-radius: 999px; background: rgb(42 31 13 / .82); color: rgb(255 238 199); font-size: 11px; white-space: nowrap; }
+.auth-screen { display: grid; place-items: center; min-height: 100vh; margin: 0; padding: 24px; color: rgb(208 214 228 / .8); font-size: 14px; text-align: center; background: #050609; }
+.auth-screen code { padding: 2px 6px; border-radius: 5px; background: rgb(255 255 255 / .08); font-size: 13px; }
+.voice-health { position: fixed; z-index: 3; top: 56px; left: 50%; margin: 0; padding: 5px 10px; transform: translateX(-50%); border: 1px solid rgb(255 205 123 / .3); border-radius: 999px; background: rgb(42 31 13 / .82); color: rgb(255 238 199); font-size: 11px; white-space: nowrap; }
+
+.hub-page { min-height: 100vh; margin: 0 auto; padding: 28px 20px 64px; max-width: 640px; color: rgb(240 243 250); background: #050609; }
+.hub-header { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 24px; }
+.hub-header h1 { margin: 0; font-size: 20px; font-weight: 650; }
+.hub-speech-status { margin: 0; color: rgb(128 232 189); font-size: 12px; }
+.hub-speech-status--warn { color: rgb(255 205 123); }
+.hub-remote-button { margin-left: auto; padding: 8px 13px; border: 1px solid rgb(255 255 255 / .16); border-radius: 999px; color: inherit; background: rgb(255 255 255 / .07); cursor: pointer; font-size: 12px; }
+.hub-remote-button:hover, .hub-remote-button:focus-visible { background: rgb(255 255 255 / .14); outline: none; }
+.hub-section { margin-bottom: 30px; }
+.hub-section h2 { margin: 0 0 12px; color: rgb(208 214 228 / .7); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }
+.hub-muted { margin: 0; color: rgb(208 214 228 / .55); font-size: 13px; }
+.hub-error { margin: 0 0 16px; padding: 9px 12px; border: 1px solid rgb(255 178 183 / .3); border-radius: 10px; background: rgb(39 16 22 / .7); color: rgb(255 203 208); font-size: 12px; }
+.hub-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+.hub-tile { display: flex; flex-direction: column; gap: 4px; padding: 14px; border: 1px solid rgb(255 255 255 / .14); border-radius: 12px; color: inherit; background: rgb(255 255 255 / .05); cursor: pointer; text-align: left; }
+.hub-tile:hover:not(:disabled), .hub-tile:focus-visible:not(:disabled) { background: rgb(255 255 255 / .1); outline: none; }
+.hub-tile:disabled { cursor: default; opacity: .45; }
+.hub-tile__label { font-size: 14px; font-weight: 600; }
+.hub-tile__desc { color: rgb(208 214 228 / .6); font-size: 11px; }
+.hub-group { margin-bottom: 18px; }
+.hub-group__title { margin: 0 0 8px; color: rgb(208 214 228 / .55); font-size: 11px; font-family: ui-monospace, monospace; }
+.hub-sessions { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.hub-session { display: flex; align-items: flex-start; gap: 10px; width: 100%; padding: 11px 13px; border: 1px solid rgb(255 255 255 / .1); border-radius: 10px; color: inherit; background: rgb(255 255 255 / .04); cursor: pointer; text-align: left; }
+.hub-session:hover, .hub-session:focus-visible { background: rgb(255 255 255 / .09); outline: none; }
+.hub-session__body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.hub-session__title { font-size: 13px; font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hub-session__meta { display: flex; gap: 8px; color: rgb(208 214 228 / .55); font-size: 11px; }
+.hub-session__badge { padding: 1px 7px; border-radius: 999px; background: rgb(255 255 255 / .09); }
+.hub-session__hint { color: rgb(128 232 189 / .85); font-size: 10px; }
+.hub-dot { flex: none; width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: rgb(95 104 119); }
+.hub-dot--open { background: rgb(70 154 255); box-shadow: 0 0 6px rgb(70 154 255 / .7); }
+.hub-dot--busy { background: rgb(255 158 68); box-shadow: 0 0 6px rgb(255 158 68 / .7); }
+.hub-dot--idle { background: rgb(95 104 119); }
+.hub-remote { position: fixed; z-index: 6; top: 50%; left: 50%; width: min(360px, calc(100vw - 24px)); max-height: min(560px, calc(100vh - 24px)); overflow: auto; padding: 16px; transform: translate(-50%, -50%); border: 1px solid rgb(255 255 255 / .14); border-radius: 12px; background: rgb(13 15 21 / .98); box-shadow: 0 18px 48px rgb(0 0 0 / .45); color: rgb(240 243 250); }
+.hub-remote__header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 13px; }
+.hub-remote__header h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.hub-remote__close { width: 26px; height: 26px; padding: 0; border: 0; border-radius: 7px; color: rgb(224 228 238 / .8); background: transparent; cursor: pointer; font-size: 21px; line-height: 1; }
+.hub-remote__close:hover, .hub-remote__close:focus-visible { background: rgb(255 255 255 / .1); outline: none; }
+.hub-remote__options { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+.hub-remote__options button { width: 100%; padding: 9px 11px; border: 1px solid rgb(255 255 255 / .14); border-radius: 8px; color: inherit; background: rgb(255 255 255 / .06); cursor: pointer; font-size: 13px; text-align: left; }
+.hub-remote__options button:hover:not(:disabled), .hub-remote__options button:focus-visible:not(:disabled) { background: rgb(255 255 255 / .12); outline: none; }
+.hub-remote__options button:disabled { cursor: default; opacity: .45; }
+.hub-remote__active { display: grid; gap: 10px; justify-items: center; text-align: center; }
+.hub-remote__url { margin: 0; padding: 8px 10px; border-radius: 8px; background: rgb(255 255 255 / .06); color: rgb(208 214 228 / .85); font-size: 11px; word-break: break-all; }
+.hub-remote__qr { width: 180px; height: 180px; border-radius: 8px; background: #fff; padding: 8px; }
+.hub-remote__active button { width: 100%; padding: 9px 11px; border: 1px solid rgb(255 178 183 / .3); border-radius: 8px; color: rgb(255 203 208); background: rgb(255 255 255 / .06); cursor: pointer; font-size: 12px; }
+.hub-remote__active button:hover, .hub-remote__active button:focus-visible { background: rgb(255 255 255 / .12); outline: none; }

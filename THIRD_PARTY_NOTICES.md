@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-pi-meldivo is MIT-licensed, but it uses and can interoperate with software and
+meldivo is MIT-licensed, but it uses and can interoperate with software and
 models under their own terms. This file identifies the material dependencies
 and optional components known to this source release. It is not a replacement
 for the complete license text supplied by each dependency.
@@ -41,6 +41,7 @@ are supplied by the respective npm packages. The main direct dependencies are:
 
 - [Express](https://www.npmjs.com/package/express) — MIT
 - [sherpa-onnx-node](https://www.npmjs.com/package/sherpa-onnx-node) — Apache-2.0
+- [qrcode](https://www.npmjs.com/package/qrcode) — MIT
 - [React](https://www.npmjs.com/package/react) and
   [React DOM](https://www.npmjs.com/package/react-dom) — MIT
 - [TypeScript](https://www.npmjs.com/package/typescript) — Apache-2.0
@@ -51,8 +52,8 @@ Transitive dependencies remain under their original licenses.
 
 ## External services and coding harnesses
 
-pi-meldivo runs as an extension inside [Pi](https://pi.dev)
-(`@earendil-works/pi-coding-agent`, a peer dependency, not bundled) and uses
-that session's model, tools, and credentials. Those services and their terms
-are selected and operated by the user; they are not bundled or redistributed
-by pi-meldivo.
+meldivo drives [Pi](https://pi.dev), [OpenCode](https://opencode.ai), and
+[Claude Code](https://claude.com/claude-code) headlessly, using each
+session's own model, tools, and credentials. None of these agents are
+bundled with meldivo; the user installs them separately, and their terms are
+selected and operated by the user.

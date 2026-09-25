@@ -1,7 +1,7 @@
 {
-  "name": "pi-meldivo",
-  "version": "0.2.1",
-  "description": "Voice mode for the Pi coding agent: talk to your Pi session hands-free with local, private speech-to-text and text-to-speech (Parakeet + Kokoro). No cloud APIs or keys.",
+  "name": "meldivo",
+  "version": "1.0.0",
+  "description": "Always-on local voice hub for coding agents: talk hands-free to your Pi, OpenCode, and Claude Code sessions from any browser or phone. Private on-device speech (Parakeet + Kokoro). No cloud speech APIs.",
   "type": "module",
   "license": "MIT",
   "author": "Amir Rouhollahi",
@@ -14,36 +14,32 @@
     "url": "https://github.com/amirrouh/meldivo/issues"
   },
   "keywords": [
-    "pi-package",
-    "pi",
-    "pi-coding-agent",
-    "pi-extension",
     "coding-agent",
-    "ai-coding-assistant",
-    "voice",
+    "claude-code",
+    "opencode",
+    "pi-coding-agent",
     "voice-assistant",
     "voice-mode",
-    "voice-control",
     "speech-to-text",
     "text-to-speech",
-    "stt",
-    "tts",
     "local-ai",
     "offline",
     "privacy",
+    "hands-free",
+    "ai-coding-assistant",
+    "developer-tools",
     "parakeet",
     "kokoro",
     "sherpa-onnx",
-    "hands-free",
-    "llm"
+    "voice-control",
+    "llm",
+    "cli"
   ],
-  "pi": {
-    "extensions": [
-      "./extensions/meldivo.ts"
-    ]
+  "bin": {
+    "meldivo": "bin/meldivo.mjs"
   },
   "files": [
-    "extensions",
+    "bin",
     "dist",
     "README.md",
     "LICENSE",
@@ -78,8 +74,5 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.5"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
   }
 }

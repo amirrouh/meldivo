@@ -1,16 +1,19 @@
 # Remote access
 
-Browsers only allow microphone access on `localhost` or over HTTPS. Meldivo's
-default link (`http://127.0.0.1:4100/...`) works fine on the same computer,
-but a phone, tablet, or another computer needs an HTTPS link instead.
+Browsers only allow microphone access on `localhost` or over HTTPS. The
+hub's default link (`http://127.0.0.1:4100/#token=...`) works fine on the
+same computer, but a phone, tablet, or another computer needs an HTTPS link
+instead.
 
-`/meldivo remote` sets that up for you. It checks which of three options are
-ready to go, lets you pick one, and prints an HTTPS room link. If none are
-ready yet, it prints a link to this page.
+Set that up with the `meldivo remote` CLI command, or from the hub's "Phone
+access" panel in the browser. Either one checks which of the three options
+below are ready to go, lets you pick one, and prints an HTTPS hub link — the
+whole hub, protected by its token, not just one session. If none are ready
+yet, it links to this page.
 
 ```text
-/meldivo remote        # set up and print an HTTPS link
-/meldivo remote stop   # turn remote access off
+meldivo remote        # set up and print an HTTPS link
+meldivo remote stop   # turn remote access off
 ```
 
 ## Quick comparison
@@ -35,12 +38,13 @@ computer an HTTPS name only your devices can reach.
 3. Turn on HTTPS certificates for your tailnet: in the
    [Tailscale admin console](https://login.tailscale.com/admin/dns), go to
    **DNS**, enable **MagicDNS**, then enable **HTTPS Certificates**.
-4. In Pi, run:
+4. Run:
    ```text
-   /meldivo remote
+   meldivo remote tailscale
    ```
-   and pick **Tailscale**. Meldivo runs `tailscale serve --bg 4100` and prints
-   a link like `https://<machine>.<tailnet>.ts.net/?room=...`.
+   (or pick **Tailscale** in the hub's "Phone access" panel). Meldivo runs
+   `tailscale serve --bg 4100` and prints a link like
+   `https://<machine>.<tailnet>.ts.net/#token=...`.
 
 Open that link on any device signed in to the same Tailscale account.
 
@@ -55,19 +59,19 @@ like a password and don't post it publicly.
    - macOS: `brew install cloudflared`
    - Linux: install the `.deb`/package for your distro, or grab a binary from
      [Cloudflare's GitHub releases](https://github.com/cloudflare/cloudflared/releases)
-2. In Pi, run:
+2. Run:
    ```text
-   /meldivo remote
+   meldivo remote cloudflare
    ```
-   and pick **Cloudflare**. Meldivo runs
+   (or pick **Cloudflare** in the hub's "Phone access" panel). Meldivo runs
    `cloudflared tunnel --url http://127.0.0.1:4100` and prints a link like
-   `https://<random>.trycloudflare.com/?room=...`.
+   `https://<random>.trycloudflare.com/#token=...`.
 
 Notes:
 - No account or login required.
 - Audio passes through Cloudflare's network on its way to you.
-- The tunnel gets a new random address each time and stops when Pi exits, or
-  when you run `/meldivo remote stop`.
+- The tunnel gets a new random address each time it starts, and stops when
+  you run `meldivo remote stop` or stop the hub service.
 
 ## 3. Own certificate (mkcert)
 
@@ -95,13 +99,13 @@ own devices trust.
           <lan-ip> <hostname>.local localhost
    ```
    (Respects `XDG_CONFIG_HOME` if you've set it.)
-5. In Pi, run:
+5. Run:
    ```text
-   /meldivo remote
+   meldivo remote certificate
    ```
-   and pick **Own certificate**. The server also listens on
-   `https://0.0.0.0:4443` (`MELDIVO_HTTPS_PORT`) and prints a link like
-   `https://<lan-ip>:4443/?room=...`.
+   (or pick **Own certificate** in the hub's "Phone access" panel). The
+   server also listens on `https://0.0.0.0:4443` (`MELDIVO_HTTPS_PORT`) and
+   prints a link like `https://<lan-ip>:4443/#token=...`.
 
 ### Trust the certificate on each device
 
@@ -157,4 +161,4 @@ domain, that works too:
   as this computer.
 - **Tailscale link doesn't have HTTPS**: make sure HTTPS Certificates is
   enabled for your tailnet in the Tailscale admin console (DNS → MagicDNS +
-  HTTPS Certificates), then run `/meldivo remote` again.
+  HTTPS Certificates), then run `meldivo remote` again.
