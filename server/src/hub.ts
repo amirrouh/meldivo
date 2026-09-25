@@ -85,7 +85,7 @@ export interface Hub {
   machines(): { name: string; online: boolean; joinedAt: number; version?: string }[];
   remove(name: string): boolean;
   hosts(): HostView[];
-  relay(name: string, key: string, message: string, conversationId: string | undefined, signal: AbortSignal, sink: TurnSink): Promise<void>;
+  relay(name: string, key: string, message: string, conversationId: string | undefined, cwd: string | undefined, signal: AbortSignal, sink: TurnSink): Promise<void>;
   /** A connected machine that offered to do speech for this hub, if any. */
   speechMachine(): string | undefined;
   /** Runs speech on that machine; rejects if none is connected or it fails. */
@@ -293,7 +293,7 @@ export function createHub(options: { configDir: string; logger: Logger; notFound
         };
       });
     },
-    relay(name, key, message, conversationId, signal, sink) {
+    relay(name, key, message, conversationId, cwd, signal, sink) {
       const machine = live.get(name);
       if (!machine) {
         sink.send({ type: "error", message: records.some((record) => record.name === name) ? `${name} is offline` : `Unknown machine "${name}"` });
@@ -315,7 +315,7 @@ export function createHub(options: { configDir: string; logger: Logger; notFound
         };
         turns.set(turnId, { machine: name, sink, finish });
         signal.addEventListener("abort", onAbort, { once: true });
-        machine.socket.send(JSON.stringify({ type: "chat", turnId, key, message, conversationId } satisfies HubMessage));
+        machine.socket.send(JSON.stringify({ type: "chat", turnId, key, message, conversationId, cwd } satisfies HubMessage));
         if (signal.aborted) onAbort();
       });
     },

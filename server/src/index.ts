@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import type { Server } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import type { AddressInfo } from "node:net";
@@ -318,10 +318,24 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     }
   }
 
+  // A new chat starts in the home folder, or in a folder one of this machine's listed sessions
+  // already uses (the hub offers exactly those), never in an arbitrary path.
+  async function resolveNewChatFolder(requested: string | undefined): Promise<string | undefined> {
+    if (!requested || requested === homeDir) return homeDir;
+    const snapshot = await getSessionsSnapshot();
+    if (!snapshot.sessions.some((session) => session.cwd === requested)) return undefined;
+    try {
+      return statSync(requested).isDirectory() ? requested : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   async function runNew(
     harness: HarnessId,
     message: string,
     conversationId: string | undefined,
+    requestedCwd: string | undefined,
     signal: AbortSignal,
     sink: TurnSink,
   ): Promise<void> {
@@ -331,12 +345,18 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       sink.end();
       return;
     }
+    const cwd = await resolveNewChatFolder(requestedCwd);
+    if (!cwd) {
+      sink.send({ type: "error", message: "That folder is not available on this machine" });
+      sink.end();
+      return;
+    }
     let id: string | null = null;
     if (conversationId) {
       const conversation = await stateStore.getConversation(conversationId);
       if (conversation && conversation.harness === harness) id = conversation.id;
     }
-    await attempt(adapter, { id, cwd: homeDir, fork: false }, message, signal, sink, {
+    await attempt(adapter, { id, cwd, fork: false }, message, signal, sink, {
       onSessionId: (sessionId) => (conversationId ? stateStore.setConversation(conversationId, { harness, id: sessionId }) : undefined),
     });
   }
@@ -385,7 +405,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   // switches to it immediately (including for a barge-in /cancel sent mid-turn), so the
   // resolved key is registered for the same controller. Keys of a joined machine's sessions
   // ("@<machine>/...") are relayed to that machine.
-  async function runTurn(key: string, message: string, conversationId: string | undefined, controller: AbortController, sink: TurnSink): Promise<void> {
+  async function runTurn(key: string, message: string, conversationId: string | undefined, cwd: string | undefined, controller: AbortController, sink: TurnSink): Promise<void> {
     activeTurns.set(key, controller);
     const target = parseMachineKey(key);
     const inner = target ? target.inner : key;
@@ -404,7 +424,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     };
     try {
       if (target) {
-        if (hub) await hub.relay(target.name, target.inner, message, conversationId, controller.signal, tracked);
+        if (hub) await hub.relay(target.name, target.inner, message, conversationId, cwd, controller.signal, tracked);
         else {
           tracked.send({ type: "error", message: "Session not found" });
           tracked.end();
@@ -412,7 +432,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       } else if (key === "quick") {
         await runQuick(message, conversationId, controller.signal, tracked);
       } else if (key.startsWith("new:")) {
-        await runNew(key.slice(4) as HarnessId, message, conversationId, controller.signal, tracked);
+        await runNew(key.slice(4) as HarnessId, message, conversationId, cwd, controller.signal, tracked);
       } else {
         const sep = key.indexOf(":");
         if (sep < 0) {
@@ -434,6 +454,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     if (!message) return res.status(400).json({ error: "message is required" });
     if (activeTurns.has(key)) return res.status(409).json({ error: "This session is busy" });
     const conversationId = readConversationId(req.body?.conversationId);
+    const cwd = readFolder(req.body?.cwd);
 
     const controller = new AbortController();
     req.on("aborted", () => controller.abort());
@@ -453,7 +474,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       end: () => { if (!res.writableEnded) res.end(); },
       get ended() { return res.writableEnded; },
     };
-    await runTurn(key, message, conversationId, controller, sink);
+    await runTurn(key, message, conversationId, cwd, controller, sink);
     sink.end();
   });
 
@@ -590,10 +611,10 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       },
       isBusy: (key) => activeTurns.has(key),
       speech: localSpeech,
-      runTurn: (key, message, conversationId, signal, sink) => {
+      runTurn: (key, message, conversationId, cwd, signal, sink) => {
         const controller = new AbortController();
         signal.addEventListener("abort", () => controller.abort(), { once: true });
-        return runTurn(key, message, conversationId, controller, sink);
+        return runTurn(key, message, conversationId, cwd, controller, sink);
       },
     });
   }
@@ -622,6 +643,10 @@ function flush(sink: TurnSink, events: TurnEvent[]): void {
 
 function readConversationId(value: unknown): string | undefined {
   return typeof value === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(value) ? value : undefined;
+}
+
+function readFolder(value: unknown): string | undefined {
+  return typeof value === "string" && value.startsWith("/") && value.length <= 1_000 && !value.includes("\0") ? value : undefined;
 }
 
 function readMessage(value: unknown): string | undefined {

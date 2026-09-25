@@ -6,7 +6,8 @@ import "./index.css";
 
 initAuth();
 
-const sessionKey = new URLSearchParams(window.location.search).get("session");
+const params = new URLSearchParams(window.location.search);
+const sessionKey = params.get("session");
 createRoot(document.getElementById("root")!).render(
-  sessionKey ? <App sessionKey={sessionKey} /> : <Hub />,
+  sessionKey ? <App sessionKey={sessionKey} folder={params.get("folder") ?? undefined} /> : <Hub />,
 );

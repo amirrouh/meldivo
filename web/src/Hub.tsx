@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { authHeaders, checkAuthorized, UnauthorizedError } from "./auth";
 import { UnauthorizedScreen } from "./UnauthorizedScreen";
-import { harnessLabel, harnessOrder, type HostInfo, type SessionInfo, type SessionsResponse } from "./session-types";
+import { harnessLabel, harnessOrder, type HarnessId, type HostInfo, type SessionInfo, type SessionsResponse } from "./session-types";
 
 const sessionsPollMs = 5_000;
 const healthPollMs = 5_000;
@@ -29,8 +29,8 @@ function relativeTime(updatedAt: number): string {
   return `${days}d ago`;
 }
 
-function openSession(key: string) {
-  window.location.href = `/?session=${encodeURIComponent(key)}`;
+function openSession(key: string, folder?: string) {
+  window.location.href = `/?session=${encodeURIComponent(key)}${folder ? `&folder=${encodeURIComponent(folder)}` : ""}`;
 }
 
 function stateDot(session: SessionInfo): { className: string; label: string } {
@@ -173,77 +173,195 @@ function MachineCard({ host, sessions, selected, onSelect }: { host: HostInfo; s
   );
 }
 
+type DateRange = "any" | "today" | "week" | "month" | "older";
+type SortOrder = "newest" | "oldest" | "title";
+const dayMs = 24 * 60 * 60 * 1000;
+
+function inRange(updatedAt: number, range: DateRange): boolean {
+  const age = Date.now() - updatedAt;
+  if (range === "today") return new Date(updatedAt).toDateString() === new Date().toDateString();
+  if (range === "week") return age <= 7 * dayMs;
+  if (range === "month") return age <= 30 * dayMs;
+  if (range === "older") return age > 30 * dayMs;
+  return true;
+}
+
+function sortSessions(sessions: SessionInfo[], order: SortOrder): SessionInfo[] {
+  const sorted = [...sessions];
+  if (order === "title") sorted.sort((a, b) => (a.title || "").localeCompare(b.title || "", undefined, { sensitivity: "base" }));
+  else sorted.sort((a, b) => (order === "oldest" ? a.updatedAt - b.updatedAt : b.updatedAt - a.updatedAt));
+  return sorted;
+}
+
+function SessionRow({ session }: { session: SessionInfo }) {
+  const dot = stateDot(session);
+  return (
+    <li>
+      <button type="button" className="hub-session" onClick={() => openSession(session.key)}>
+        <span className={dot.className} aria-hidden="true" title={dot.label} />
+        <span className="hub-session__body">
+          <span className="hub-session__title">{session.title || "(untitled)"}</span>
+          <span className="hub-session__meta">
+            <span className="hub-session__badge">{harnessLabel[session.harness]}</span>
+            <span className="hub-session__time">{relativeTime(session.updatedAt)}</span>
+          </span>
+          {session.open && <span className="hub-session__hint">open in a terminal · continues as a voice copy</span>}
+        </span>
+      </button>
+    </li>
+  );
+}
+
+function NewChat({ host, folders, agent, folder, onClose }: { host: HostInfo; folders: string[]; agent: HarnessId | "all"; folder: string; onClose: () => void }) {
+  const available = [...host.harnesses].filter((harness) => harness.available).sort((a, b) => harnessOrder.indexOf(a.id) - harnessOrder.indexOf(b.id));
+  const [chosenAgent, setChosenAgent] = useState<HarnessId | undefined>(
+    available.find((harness) => harness.id === agent)?.id ?? available[0]?.id,
+  );
+  const [chosenFolder, setChosenFolder] = useState(folder === "all" ? "" : folder);
+  if (available.length === 0) return <div className="hub-newchat"><p className="hub-muted">No coding agents are installed on {host.name}.</p></div>;
+  return (
+    <div className="hub-newchat" role="group" aria-label="New chat">
+      <div className="hub-newchat__row">
+        <span className="hub-newchat__label">Agent</span>
+        <div className="hub-chips">
+          {available.map((harness) => (
+            <button key={harness.id} type="button" className={`hub-chip${chosenAgent === harness.id ? " hub-chip--on" : ""}`} aria-pressed={chosenAgent === harness.id}
+              onClick={() => setChosenAgent(harness.id)}>{harness.label}</button>
+          ))}
+        </div>
+      </div>
+      <label className="hub-newchat__row">
+        <span className="hub-newchat__label">Folder</span>
+        <select className="hub-select hub-select--wide" value={chosenFolder} onChange={(event) => setChosenFolder(event.target.value)}>
+          <option value="">Home folder</option>
+          {folders.map((cwd) => <option key={cwd} value={cwd}>{shortenCwd(cwd)}</option>)}
+        </select>
+      </label>
+      <div className="hub-newchat__actions">
+        <button type="button" className="hub-more" onClick={onClose}>Cancel</button>
+        <button type="button" className="hub-primary" disabled={!chosenAgent}
+          onClick={() => chosenAgent && openSession(`${hostKeyPrefix(host)}new:${chosenAgent}`, chosenFolder || undefined)}>
+          Start talking
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function MachinePanel({ host, sessions }: { host: HostInfo; sessions: SessionInfo[] }) {
   const [query, setQuery] = useState("");
+  const [agent, setAgent] = useState<HarnessId | "all">("all");
+  const [folder, setFolder] = useState("all");
+  const [range, setRange] = useState<DateRange>("any");
+  const [order, setOrder] = useState<SortOrder>("newest");
   const [openOnly, setOpenOnly] = useState(false);
+  const [newChatOpen, setNewChatOpen] = useState(false);
   const [limit, setLimit] = useState(pageSize);
-  useEffect(() => { setQuery(""); setOpenOnly(false); setLimit(pageSize); }, [host.id]);
+  useEffect(() => {
+    setQuery(""); setAgent("all"); setFolder("all"); setRange("any"); setOrder("newest"); setOpenOnly(false); setNewChatOpen(false); setLimit(pageSize);
+  }, [host.id]);
+  useEffect(() => setLimit(pageSize), [query, agent, folder, range, order, openOnly]);
 
   if (!host.online) {
     return <p className="hub-empty">{host.name} is offline. Its sessions appear here as soon as it reconnects.</p>;
   }
 
-  const prefix = hostKeyPrefix(host);
-  const harnesses = [...host.harnesses].sort((a, b) => harnessOrder.indexOf(a.id) - harnessOrder.indexOf(b.id));
+  // Folders are detected from the sessions themselves, most recently active first.
+  const folderActivity = new Map<string, number>();
+  for (const session of sessions) folderActivity.set(session.cwd, Math.max(folderActivity.get(session.cwd) ?? 0, session.updatedAt));
+  const folders = [...folderActivity.entries()].sort((a, b) => b[1] - a[1]).map(([cwd]) => cwd);
+  const newChatFolders = folders.filter((cwd) => cwd && shortenCwd(cwd) !== "~");
+
+  const agents = harnessOrder.filter((id) => sessions.some((session) => session.harness === id));
   const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const matches = sessions
-    .filter((session) => !openOnly || session.open)
-    .filter((session) => {
-      if (terms.length === 0) return true;
-      const haystack = `${session.title} ${shortenCwd(session.cwd)} ${harnessLabel[session.harness]}`.toLowerCase();
-      return terms.every((term) => haystack.includes(term));
-    })
-    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const matches = sortSessions(sessions.filter((session) => {
+    if (agent !== "all" && session.harness !== agent) return false;
+    if (folder !== "all" && session.cwd !== folder) return false;
+    if (openOnly && !session.open) return false;
+    if (!inRange(session.updatedAt, range)) return false;
+    if (terms.length === 0) return true;
+    const haystack = `${session.title} ${shortenCwd(session.cwd)} ${harnessLabel[session.harness]}`.toLowerCase();
+    return terms.every((term) => haystack.includes(term));
+  }), order);
   const openCount = sessions.filter((session) => session.open).length;
+  const filtered = agent !== "all" || folder !== "all" || range !== "any" || openOnly || terms.length > 0;
+
+  // Group the visible page by folder, keeping the chosen order inside and across groups.
+  const visible = matches.slice(0, limit);
+  const groups: { cwd: string; sessions: SessionInfo[] }[] = [];
+  for (const session of visible) {
+    const group = folder === "all" ? groups.find((entry) => entry.cwd === session.cwd) : groups[0];
+    if (group) group.sessions.push(session);
+    else groups.push({ cwd: session.cwd, sessions: [session] });
+  }
 
   return (
     <div className="hub-panel" role="tabpanel">
-      <div className="hub-new" aria-label="Start a new chat">
-        {harnesses.map((harness) => (
-          <button key={harness.id} type="button" className="hub-new__button" disabled={!harness.available}
-            title={harness.available ? "New chat in the home folder" : "Not installed"}
-            aria-label={`New ${harness.label} chat`}
-            onClick={() => openSession(`${prefix}new:${harness.id}`)}>
-            <span aria-hidden="true">+ </span>{harness.label}
-          </button>
-        ))}
-        {harnesses.length === 0 && <span className="hub-muted">No coding agents on this machine.</span>}
+      <div className="hub-search">
+        <input type="search" className="hub-search__input" placeholder={`Search ${sessions.length} sessions`} value={query}
+          onChange={(event) => setQuery(event.target.value)} aria-label="Search sessions" autoComplete="off" />
+        <button type="button" className="hub-primary" aria-expanded={newChatOpen} onClick={() => setNewChatOpen(!newChatOpen)}>
+          {newChatOpen ? "Close" : "New chat"}
+        </button>
       </div>
 
+      {newChatOpen && <NewChat host={host} folders={newChatFolders} agent={agent} folder={folder} onClose={() => setNewChatOpen(false)} />}
+
       {sessions.length > 0 && (
-        <div className="hub-search">
-          <input type="search" className="hub-search__input" placeholder={`Search ${sessions.length} sessions`} value={query}
-            onChange={(event) => { setQuery(event.target.value); setLimit(pageSize); }} aria-label="Search sessions" autoComplete="off" />
-          <button type="button" className={`hub-chip${openOnly ? " hub-chip--on" : ""}`} aria-pressed={openOnly}
-            onClick={() => { setOpenOnly(!openOnly); setLimit(pageSize); }} disabled={openCount === 0 && !openOnly}>
-            Open now{openCount > 0 ? ` ${openCount}` : ""}
-          </button>
+        <div className="hub-filters">
+          <div className="hub-chips" role="group" aria-label="Filter by agent">
+            <button type="button" className={`hub-chip${agent === "all" ? " hub-chip--on" : ""}`} aria-pressed={agent === "all"} onClick={() => setAgent("all")}>
+              All agents
+            </button>
+            {agents.map((id) => (
+              <button key={id} type="button" className={`hub-chip${agent === id ? " hub-chip--on" : ""}`} aria-pressed={agent === id} onClick={() => setAgent(agent === id ? "all" : id)}>
+                {harnessLabel[id]} <span className="hub-chip__count">{sessions.filter((session) => session.harness === id).length}</span>
+              </button>
+            ))}
+            <button type="button" className={`hub-chip${openOnly ? " hub-chip--on" : ""}`} aria-pressed={openOnly} disabled={openCount === 0 && !openOnly} onClick={() => setOpenOnly(!openOnly)}>
+              Open now <span className="hub-chip__count">{openCount}</span>
+            </button>
+          </div>
+          <div className="hub-selects">
+            <select className="hub-select" value={folder} onChange={(event) => setFolder(event.target.value)} aria-label="Folder">
+              <option value="all">All folders ({folders.length})</option>
+              {folders.map((cwd) => <option key={cwd} value={cwd}>{shortenCwd(cwd) || "(no folder)"}</option>)}
+            </select>
+            <select className="hub-select" value={range} onChange={(event) => setRange(event.target.value as DateRange)} aria-label="Date">
+              <option value="any">Any time</option>
+              <option value="today">Today</option>
+              <option value="week">Past 7 days</option>
+              <option value="month">Past 30 days</option>
+              <option value="older">Older than 30 days</option>
+            </select>
+            <select className="hub-select" value={order} onChange={(event) => setOrder(event.target.value as SortOrder)} aria-label="Sort">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="title">Title A–Z</option>
+            </select>
+          </div>
         </div>
       )}
 
-      {sessions.length === 0 && <p className="hub-empty">No sessions yet. Start a new chat above.</p>}
-      {sessions.length > 0 && matches.length === 0 && <p className="hub-empty">No sessions match.</p>}
-      <ul className="hub-sessions">
-        {matches.slice(0, limit).map((session) => {
-          const dot = stateDot(session);
-          return (
-            <li key={session.key}>
-              <button type="button" className="hub-session" onClick={() => openSession(session.key)}>
-                <span className={dot.className} aria-hidden="true" title={dot.label} />
-                <span className="hub-session__body">
-                  <span className="hub-session__title">{session.title || "(untitled)"}</span>
-                  <span className="hub-session__meta">
-                    <span className="hub-session__badge">{harnessLabel[session.harness]}</span>
-                    <span className="hub-session__cwd">{shortenCwd(session.cwd)}</span>
-                    <span className="hub-session__time">{relativeTime(session.updatedAt)}</span>
-                  </span>
-                  {session.open && <span className="hub-session__hint">open in a terminal · continues as a voice copy</span>}
-                </span>
-              </button>
-            </li>
-          );
-        })}
-      </ul>
+      {sessions.length === 0 && <p className="hub-empty">No sessions on {host.name} yet. Tap New chat to start one.</p>}
+      {sessions.length > 0 && matches.length === 0 && (
+        <p className="hub-empty">No sessions match. <button type="button" className="hub-link" onClick={() => {
+          setQuery(""); setAgent("all"); setFolder("all"); setRange("any"); setOpenOnly(false);
+        }}>Clear filters</button></p>
+      )}
+      {filtered && matches.length > 0 && <p className="hub-count">{matches.length} of {sessions.length} sessions</p>}
+
+      {groups.map((group) => (
+        <section key={group.cwd} className="hub-folder">
+          <h3 className="hub-folder__title">
+            <span>{shortenCwd(group.cwd) || "(no folder)"}</span>
+            <span className="hub-folder__count">{matches.filter((session) => session.cwd === group.cwd).length}</span>
+          </h3>
+          <ul className="hub-sessions">
+            {group.sessions.map((session) => <SessionRow key={session.key} session={session} />)}
+          </ul>
+        </section>
+      ))}
       {matches.length > limit && (
         <button type="button" className="hub-more" onClick={() => setLimit(limit + pageSize)}>
           Show more ({matches.length - limit})

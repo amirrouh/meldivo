@@ -96,7 +96,7 @@ export interface MachineClientOptions {
   /** This machine's speech engine, used for the hub when the link has `speech` set. */
   speech?: SpeechEngine;
   isBusy(key: string): boolean;
-  runTurn(key: string, message: string, conversationId: string | undefined, signal: AbortSignal, sink: TurnSink): Promise<void>;
+  runTurn(key: string, message: string, conversationId: string | undefined, cwd: string | undefined, signal: AbortSignal, sink: TurnSink): Promise<void>;
 }
 
 export interface MachineClient {
@@ -181,7 +181,8 @@ export function startMachineClient(options: MachineClientOptions): MachineClient
     // Audit trail on this machine: which session the hub drove, never what was said.
     logger.info("hub_turn", { harness, kind: message.key.startsWith("new:") ? "new" : "existing" });
     const conversationId = typeof message.conversationId === "string" ? message.conversationId : undefined;
-    void options.runTurn(message.key, message.message, conversationId, controller.signal, sink)
+    const cwd = typeof message.cwd === "string" ? message.cwd : undefined;
+    void options.runTurn(message.key, message.message, conversationId, cwd, controller.signal, sink)
       .catch((error: unknown) => sink.send({ type: "error", message: error instanceof Error ? error.message : "Turn failed" }))
       .finally(() => {
         turns.delete(turnId);

@@ -472,6 +472,35 @@ test("Meldivo hub: cancel finds a new:<harness> turn by its resolved <harness>:<
   assert.equal(again.status, 404);
 });
 
+test("Meldivo hub: a new chat starts in the home folder or a listed session's folder, nowhere else", async (t) => {
+  const secret = "s".repeat(32);
+  const project = mkdtempSync(path.join(tmpdir(), "meldivo-project-"));
+  const claude = fakeAdapter("claude", "Claude Code", {
+    sessions: [{ key: "claude:abc", harness: "claude", id: "abc", title: "Work", cwd: project, updatedAt: 1, open: false }],
+  });
+  const server = await startServer({
+    port: 0, secret, speech: fakeSpeechEngine(), webDir: "/does/not/exist",
+    adapters: [fakeAdapter("pi", "Pi"), fakeAdapter("opencode", "OpenCode"), claude], stateDir: tmpStateDir(),
+  });
+  t.after(() => server.close());
+  const chat = (cwd) => fetch(`http://127.0.0.1:${server.port}/api/sessions/new:claude/chat`, {
+    method: "POST", headers: { "content-type": "application/json", "x-meldivo-token": secret },
+    body: JSON.stringify({ message: "hi", ...(cwd ? { cwd } : {}) }),
+  }).then(readSseUntilDone);
+
+  claude.queueSend(() => okTurn("n1", ["ok"]));
+  assert.equal((await chat(project)).at(-1).type, "done");
+  assert.equal(claude.calls.at(-1).target.cwd, project);
+
+  const refused = await chat(tmpdir());
+  assert.equal(refused.at(-1).type, "error");
+  assert.equal(claude.calls.length, 1);
+
+  claude.queueSend(() => okTurn("n2", ["ok"]));
+  assert.equal((await chat()).at(-1).type, "done");
+  assert.equal(claude.calls.at(-1).target.cwd, (await import("node:os")).homedir());
+});
+
 test("Meldivo hub: voice endpoints", async (t) => {
   const secret = "s".repeat(32);
   const server = await startServer({

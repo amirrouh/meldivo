@@ -29,6 +29,8 @@ import { harnessLabel, splitHostKey, type HarnessId, type SessionsResponse, type
 
 interface AppProps {
   sessionKey: string;
+  /** Folder a new chat starts in (absolute path); the home folder when unset. */
+  folder?: string;
 }
 
 type SessionDisplay = { harness?: HarnessId; title: string; cwd: string; host?: string };
@@ -41,6 +43,11 @@ function deriveSessionDisplay(fullKey: string): SessionDisplay {
   const separator = key.indexOf(":");
   if (separator === -1) return { title: key, cwd: "", host };
   return { harness: key.slice(0, separator) as HarnessId, title: key.slice(separator + 1), cwd: "", host };
+}
+
+function shortFolder(cwd: string): string {
+  const home = /^(\/home\/[^/]+|\/Users\/[^/]+)(\/.*)?$/.exec(cwd);
+  return home ? `~${home[2] ?? ""}` : cwd;
 }
 
 function conversationStorageKey(sessionKey: string): string {
@@ -128,7 +135,7 @@ async function streamTurnEvents(response: Response, onEvent: (event: TurnEvent) 
   }
 }
 
-export default function App({ sessionKey }: AppProps) {
+export default function App({ sessionKey, folder }: AppProps) {
   const [state, setState] = useState<VoiceState>("idle");
   const [level, setLevel] = useState(0);
   const [error, setError] = useState("");
@@ -153,7 +160,7 @@ export default function App({ sessionKey }: AppProps) {
   const acceptedWatchdog = useRef<number | null>(null);
   const errorTimer = useRef<number | null>(null);
   const errorToken = useRef(0);
-  const conversationId = useRef(getConversationId(sessionKey));
+  const conversationId = useRef(getConversationId(folder ? `${sessionKey}|${folder}` : sessionKey));
   const liveKey = useRef(sessionKey);
   // The key the server registered the in-flight turn's AbortController under (the
   // request key at POST time). A "new:<harness>" turn rewrites liveKey to the
@@ -177,7 +184,10 @@ export default function App({ sessionKey }: AppProps) {
   const [selectedVoice, setSelectedVoice] = useState(() => readVoicePreference() ?? "");
   const [savedVoice, setSavedVoice] = useState(() => readVoicePreference() ?? "");
   const [speechHealth, setSpeechHealth] = useState<SpeechHealth>({ ready: true, downloading: false });
-  const [sessionDisplay, setSessionDisplay] = useState<SessionDisplay>(() => deriveSessionDisplay(sessionKey));
+  const [sessionDisplay, setSessionDisplay] = useState<SessionDisplay>(() => {
+    const display = deriveSessionDisplay(sessionKey);
+    return folder && splitHostKey(sessionKey).inner.startsWith("new:") ? { ...display, cwd: shortFolder(folder) } : display;
+  });
   const [unauthorized, setUnauthorized] = useState(false);
   const [statusText, setStatusText] = useState("");
   const [usingFallbackVad, setUsingFallbackVad] = useState(false);
@@ -635,7 +645,11 @@ export default function App({ sessionKey }: AppProps) {
       activeChatKey.current = chatKey;
       const response = await fetch(`/api/sessions/${encodeURIComponent(chatKey)}/chat`, {
         method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...authHeaders() },
-        body: JSON.stringify({ conversationId: conversationId.current, message }), signal: controller.signal,
+        body: JSON.stringify({
+          conversationId: conversationId.current,
+          message,
+          ...(folder && splitHostKey(chatKey).inner.startsWith("new:") ? { cwd: folder } : {}),
+        }), signal: controller.signal,
       });
       checkAuthorized(response);
       if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? "Chat request failed.");
