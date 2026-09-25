@@ -3,9 +3,11 @@ import type { Request, RequestHandler, Response } from "express";
 
 // Everything the hub serves, including the page itself, requires the secret. A browser proves
 // it either with the X-Meldivo-Token header (API calls) or with an HttpOnly cookie set by
-// POST /api/unlock. The lock page below is the only thing an unauthenticated visitor gets: it
-// reads the key from the link's #fragment (never sent to servers, so it stays out of proxy
-// logs), exchanges it for the cookie, and reloads.
+// POST /api/unlock. An unauthenticated visitor gets a plain "404 Not Found" for every request,
+// so the address gives no hint that anything is there. That page quietly reads the key from
+// the link's #fragment (never sent to servers, so it stays out of proxy logs), exchanges it
+// for the cookie, and reloads; tapping it five times reveals a key field for devices that only
+// have the bare address (e.g. a Home Screen app that lost its cookie).
 
 const COOKIE_NAME = "meldivo_session";
 const COOKIE_MAX_AGE_S = 365 * 24 * 60 * 60;
@@ -37,21 +39,25 @@ export function createAccessGate(secret: string): AccessGate {
       res.setHeader("Cache-Control", "private, no-cache");
       return next();
     }
-    res.setHeader("Cache-Control", "no-store");
-    if (req.path === "/api" || req.path.startsWith("/api/")) return res.status(404).json({ error: "Not found" });
-    if (req.method !== "GET" && req.method !== "HEAD") return res.status(404).end();
-    res.status(401).type("html").send(LOCK_PAGE);
+    notFound(req, res);
   };
 
   const unlock: RequestHandler = (req, res) => {
     const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+    if (!token || !safeEqual(secret, token)) return notFound(req, res);
     res.setHeader("Cache-Control", "no-store");
-    if (!token || !safeEqual(secret, token)) return res.status(401).json({ error: "Invalid key" });
     setSessionCookie(req, res, cookieValue);
     res.status(204).end();
   };
 
   return { middleware, unlock, isAuthorized };
+}
+
+// The same bare 404 for every unauthenticated request, page or API, right key path or not.
+function notFound(req: Request, res: Response): void {
+  res.removeHeader("X-Request-Id");
+  res.status(404).set({ "Cache-Control": "no-store", "Content-Type": "text/html" });
+  res.end(req.method === "HEAD" ? undefined : NOT_FOUND_PAGE);
 }
 
 function setSessionCookie(req: Request, res: Response, value: string): void {
@@ -82,37 +88,43 @@ function safeEqual(expected: string, candidate: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-// Deliberately bare: no title, branding, or hint of what is behind it.
-const LOCK_PAGE = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow"><title></title>
-<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#050609;color:#aab;font:14px system-ui,sans-serif}
-form{display:none;gap:8px}input{width:260px;padding:9px 11px;border:1px solid #334;border-radius:8px;background:#0c0f16;color:#dde}
-button{padding:9px 13px;border:0;border-radius:8px;background:#233;color:#dde}</style></head>
-<body><form id="f"><input id="k" type="password" autocomplete="off" aria-label="Key"><button>Open</button></form>
+// Looks like a web server's stock 404. The script only acts on a #token= link or five taps.
+const NOT_FOUND_PAGE = `<html>
+<head><title>404 Not Found</title><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr>
 <script>
 (function () {
-  function keyFrom(value) {
-    var match = /(?:^|[#&?])token=([^&]+)/.exec(value);
-    return decodeURIComponent(match ? match[1] : value).trim();
-  }
   function unlock(key) {
     return fetch("/api/unlock", { method: "POST", headers: { "Content-Type": "application/json" },
       credentials: "same-origin", body: JSON.stringify({ token: key }) }).then(function (r) { return r.ok; });
   }
-  var hashKey = keyFrom(location.hash);
-  var form = document.getElementById("f");
-  function showForm() { form.style.display = "flex"; }
-  form.addEventListener("submit", function (event) {
-    event.preventDefault();
-    var key = keyFrom(document.getElementById("k").value);
-    unlock(key).then(function (ok) {
-      if (!ok) return;
-      history.replaceState(null, "", location.pathname + location.search + "#token=" + encodeURIComponent(key));
-      location.reload();
+  var match = /[#&]token=([^&]+)/.exec(location.hash);
+  if (match) unlock(decodeURIComponent(match[1]).trim()).then(function (ok) { if (ok) location.reload(); });
+  var taps = 0, first = 0;
+  document.addEventListener("click", function () {
+    var now = Date.now();
+    if (now - first > 3000) { first = now; taps = 0; }
+    if (++taps < 5 || document.querySelector("input")) return;
+    var input = document.createElement("input");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.addEventListener("keydown", function (event) {
+      if (event.key !== "Enter") return;
+      var key = input.value.replace(/^.*[#&]token=/, "").trim();
+      try { key = decodeURIComponent(key); } catch (e) {}
+      unlock(key).then(function (ok) {
+        if (!ok) { input.value = ""; return; }
+        history.replaceState(null, "", location.pathname + location.search + "#token=" + encodeURIComponent(key));
+        location.reload();
+      });
     });
+    document.body.appendChild(input);
+    input.focus();
   });
-  if (hashKey && location.hash) unlock(hashKey).then(function (ok) { ok ? location.reload() : showForm(); }, showForm);
-  else showForm();
 })();
-</script></body></html>`;
+</script>
+</body>
+</html>
+`;

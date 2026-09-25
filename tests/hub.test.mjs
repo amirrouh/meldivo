@@ -153,14 +153,19 @@ test("Meldivo hub: auth and /api/sessions shape", async (t) => {
   t.after(() => server.close());
   const base = `http://127.0.0.1:${server.port}`;
 
-  await t.test("nothing is served without the secret: API is 404, pages get the bare lock screen", async () => {
-    const health = await fetch(`${base}/api/health`);
-    assert.equal(health.status, 404);
-    const page = await fetch(`${base}/`);
-    assert.equal(page.status, 401);
-    assert.equal(page.headers.get("cache-control"), "no-store");
-    const html = await page.text();
-    assert.match(html, /\/api\/unlock/);
+  await t.test("nothing is served without the secret: every request gets the same plain 404", async () => {
+    const bodies = new Set();
+    for (const [url, init] of [[`${base}/api/health`], [`${base}/`], [`${base}/assets/x.js`], [`${base}/api/unlock`, { method: "POST" }]]) {
+      const response = await fetch(url, init);
+      assert.equal(response.status, 404);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("x-request-id"), null);
+      assert.equal(response.headers.get("etag"), null);
+      bodies.add(await response.text());
+    }
+    assert.equal(bodies.size, 1);
+    const [html] = bodies;
+    assert.match(html, /404 Not Found/);
     assert.doesNotMatch(html, /meldivo|Meldivo/);
   });
 
@@ -176,7 +181,7 @@ test("Meldivo hub: auth and /api/sessions shape", async (t) => {
     const wrong = await fetch(`${base}/api/unlock`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: "wrong" }),
     });
-    assert.equal(wrong.status, 401);
+    assert.equal(wrong.status, 404);
     assert.equal(wrong.headers.get("set-cookie"), null);
     const right = await fetch(`${base}/api/unlock`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: secret }),
