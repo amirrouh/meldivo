@@ -446,3 +446,36 @@ test("speech chunking joins tiny fragments and emits early stable phrases", () =
   assert.equal(result.rest, " Next words");
   assert.deepEqual(consumeSpeechChunks(result.rest, true).chunks, ["Next words"]);
 });
+
+test("the first chunk of a turn breaks at a clause instead of waiting for a full sentence", () => {
+  const text = "This is a fairly long opening clause that keeps going, and only ends here. Then a second sentence follows.";
+  const result = consumeSpeechChunks(text, false, true);
+  assert.deepEqual(result.chunks, [
+    "This is a fairly long opening clause that keeps going,",
+    "and only ends here.",
+  ]);
+  assert.equal(result.rest, " Then a second sentence follows.");
+});
+
+test("the early first-chunk boundary only applies once per call, not to every later chunk", () => {
+  const text = "Short start, but this sentence keeps rolling on and on. Second sentence is also long enough. Third one too, here.";
+  const first = consumeSpeechChunks(text, false, true);
+  // The first phrase may break early at a clause; every later phrase in the
+  // same call still needs a full sentence boundary before it is emitted.
+  assert.ok(first.chunks.length >= 1);
+  for (const chunk of first.chunks.slice(1)) {
+    assert.ok(/[.!?]\s*$/.test(chunk), `expected a sentence-ending chunk, got: ${chunk}`);
+  }
+});
+
+test("a short turn opener without punctuation is not split into a premature fragment", () => {
+  const result = consumeSpeechChunks("Hi there", false, true);
+  assert.deepEqual(result.chunks, []);
+  assert.equal(result.rest, "Hi there");
+});
+
+test("consumeSpeechChunks without `first` keeps the original full-sentence behavior", () => {
+  const text = "This is a fairly long opening clause that keeps going, and only ends here. Then a second sentence follows.";
+  const result = consumeSpeechChunks(text, false);
+  assert.deepEqual(result.chunks, ["This is a fairly long opening clause that keeps going, and only ends here."]);
+});

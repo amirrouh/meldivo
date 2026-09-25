@@ -634,7 +634,7 @@ export default function App({ sessionKey }: AppProps) {
               updateState("thinking");
             }
             pending += event.text;
-            const result = consumeSpeechChunks(pending);
+            const result = consumeSpeechChunks(pending, false, !spoken);
             pending = result.rest;
             if (result.chunks.length) {
               spoken = true;
@@ -654,7 +654,7 @@ export default function App({ sessionKey }: AppProps) {
         }
       });
       if (id === generation.current) {
-        const final = consumeSpeechChunks(pending, true);
+        const final = consumeSpeechChunks(pending, true, !spoken);
         if (final.chunks.length) {
           spoken = true;
           pipeline.current?.enqueue(final.chunks);

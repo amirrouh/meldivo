@@ -25,7 +25,14 @@ export interface SpeechEngine {
 // ---------------------------------------------------------------------------
 
 const PARAKEET_DIR = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
-const KOKORO_DIR = "kokoro-int8-multi-lang-v1_0";
+// fp32, not int8: benchmarking on the CPU-only target box (AMD Ryzen 9
+// 5900XT, no AVX512-VNNI) showed the int8-quantized Kokoro model is
+// *slower* than fp32 (~2.17s vs ~1.37s synthesis for a 9-word sentence,
+// real-time factor ~1.08 vs ~0.69) because onnxruntime falls back to
+// dequantize-then-compute kernels without VNNI. fp32 also beat the
+// English-only kokoro-en-v0_19 fp32 model (~1.86s) while keeping full
+// multi-language voice support.
+const KOKORO_DIR = "kokoro-multi-lang-v1_0";
 
 interface ModelSpec {
   dirName: string;
@@ -46,10 +53,10 @@ const PARAKEET_SPEC: ModelSpec = {
 
 const KOKORO_SPEC: ModelSpec = {
   dirName: KOKORO_DIR,
-  url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_0.tar.bz2",
-  sha256: "4c3052abaa60943a341f193888cf6abd68787dae6ab8ae5c925a706caa247e4e",
-  sizeBytes: 132_303_094,
-  requiredFiles: ["model.int8.onnx", "voices.bin", "tokens.txt"],
+  url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2",
+  sha256: "c5f7e2d2caf082bc1d20fb70334a61d99d20b484500aad32e7cf84c128ea3298",
+  sizeBytes: 349_906_910,
+  requiredFiles: ["model.onnx", "voices.bin", "tokens.txt"],
 };
 
 // Kokoro v1.0 multi-lang speaker table (index == speaker id), extracted from
@@ -68,6 +75,31 @@ export const KOKORO_VOICES: readonly string[] = [
 ];
 
 const DEFAULT_VOICE = "af_heart";
+
+// ---------------------------------------------------------------------------
+// Thread configuration
+// ---------------------------------------------------------------------------
+
+// Kokoro scales well with threads when numThreads is set on the *model* config (measured on a
+// 16-core Ryzen: 1 thread 1.38 s, 8 threads 0.35 s for a short sentence); gains flatten past 8.
+const CPU_COUNT = os.availableParallelism?.() ?? os.cpus().length;
+const DEFAULT_THREADS = Math.min(4, CPU_COUNT);
+const DEFAULT_TTS_THREADS = Math.min(8, CPU_COUNT);
+
+function threadsFromEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function sttThreads(): number {
+  return threadsFromEnv("MELDIVO_STT_THREADS") ?? DEFAULT_THREADS;
+}
+
+function ttsThreads(): number {
+  return threadsFromEnv("MELDIVO_TTS_THREADS") ?? DEFAULT_TTS_THREADS;
+}
 
 // ---------------------------------------------------------------------------
 // WAV parse/encode helpers (pure, no native deps — exported for unit tests)
@@ -256,7 +288,6 @@ export function createSherpaEngine(options?: { modelsDir?: string }): SpeechEngi
     loadPromise = (async () => {
       try {
         const sherpa = await importSherpa();
-        const numThreads = Math.min(4, os.cpus().length);
 
         // Weight progress: parakeet is ~79% of total download bytes, kokoro ~21%.
         const total = PARAKEET_SPEC.sizeBytes + KOKORO_SPEC.sizeBytes;
@@ -279,7 +310,7 @@ export function createSherpaEngine(options?: { modelsDir?: string }): SpeechEngi
             },
             tokens: path.join(parakeetDir, "tokens.txt"),
             modelType: "nemo_transducer",
-            numThreads,
+            numThreads: sttThreads(),
             provider: "cpu",
             debug: false,
           },
@@ -288,20 +319,36 @@ export function createSherpaEngine(options?: { modelsDir?: string }): SpeechEngi
         const tts = await sherpa.OfflineTts.createAsync({
           model: {
             kokoro: {
-              model: path.join(kokoroDir, "model.int8.onnx"),
+              model: path.join(kokoroDir, "model.onnx"),
               voices: path.join(kokoroDir, "voices.bin"),
               tokens: path.join(kokoroDir, "tokens.txt"),
               dataDir: path.join(kokoroDir, "espeak-ng-data"),
               lexicon: path.join(kokoroDir, "lexicon-us-en.txt"),
               lang: "en-us",
             },
+            // sherpa-onnx reads these from the model config; at the top level they are ignored.
+            numThreads: ttsThreads(),
+            provider: "cpu",
+            debug: false,
           },
           maxNumSentences: 1,
-          numThreads,
-          provider: "cpu",
         });
 
         state.ready = true;
+
+        // Warm up: the first real synthesize/transcribe call after load()
+        // should not pay any one-time initialization cost (e.g. onnxruntime
+        // kernel selection, espeak-ng data loading). Benchmarking showed
+        // this pays off mostly for the download+load latency being moved
+        // off the request path (warmup() is invoked at process startup,
+        // before any user request), not per-call JIT — but it's cheap
+        // insurance either way and costs nothing on the hot path.
+        try {
+          await tts.generateAsync({ text: "warm up", sid: Math.max(0, KOKORO_VOICES.indexOf(DEFAULT_VOICE)), speed: 1.0 });
+        } catch {
+          // Non-fatal: a failed warmup synth shouldn't block engine readiness.
+        }
+
         return { recognizer, tts };
       } catch (err) {
         state.downloading = false;

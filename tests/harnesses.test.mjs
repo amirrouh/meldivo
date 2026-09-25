@@ -11,6 +11,7 @@ import {
   createPiAdapter,
   listAllSessions,
 } from "../server/src/harnesses/index.ts";
+import { _killAllWarmOpenCodeServersForTests } from "../server/src/harnesses/opencode.ts";
 
 const FIXTURES = path.join(import.meta.dirname, "fixtures", "harnesses");
 const tmpDirs = [];
@@ -22,6 +23,7 @@ function makeTmpHome(prefix) {
 }
 
 after(() => {
+  _killAllWarmOpenCodeServersForTests();
   for (const dir of tmpDirs) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -300,50 +302,319 @@ test("opencode listSessions: reads session table, skips children and archived", 
   assert.equal(sessions[1].id, "ses-2");
 });
 
-test("opencode send(): maps text/tool_use events, honors -s/--fork/new-session", async () => {
-  const home = makeTmpHome("opencode-send-");
-  createOpenCodeFixtureDb(home);
-  const argsLog = path.join(home, "args.json");
-  const cli = writeFakeCli(
-    home,
+// ---------------------------------------------------------------------------
+// OpenCode send(): warm `opencode serve` + HTTP/SSE
+// ---------------------------------------------------------------------------
+
+/**
+ * Writes a fake `opencode` CLI that understands `--version` and `serve`.
+ * `serve` starts a real (loopback) HTTP server implementing just enough of
+ * the OpenCode server API (basic-auth, /session, /session/:id/fork,
+ * /session/:id/prompt_async, /session/:id/permissions/:id, and an
+ * `/event` SSE stream) to drive the adapter's warm-server code path.
+ *
+ * Behavior is driven by env vars read at spawn time:
+ * - OPENCODE_TEST_CONFIG: JSON `{ createId, forkId, eventsBySession }` —
+ *   `eventsBySession[sessionId]` is an array of SSE event objects replayed
+ *   (with a small stagger) to all connected /event subscribers once a
+ *   prompt_async lands for that session.
+ * - PROMPT_LOG_FILE / PERMISSION_LOG_FILE: optional NDJSON append logs.
+ * - SPAWN_LOG_FILE: optional log appended to once per `serve` invocation,
+ *   used to assert the adapter only ever spawns one warm process.
+ */
+function writeFakeOpenCodeServer(dir) {
+  return writeFakeCli(
+    dir,
     "fake-opencode",
     `
+const http = require("http");
 const fs = require("fs");
+const urlMod = require("url");
+
 const args = process.argv.slice(2);
-if (process.env.ARGS_LOG_FILE) fs.writeFileSync(process.env.ARGS_LOG_FILE, JSON.stringify(args));
-const lines = [
-  { type: "step_start", part: { sessionID: "ses-new" } },
-  { type: "text", part: { sessionID: "ses-new", text: "Hello there" } },
-  { type: "tool_use", part: { sessionID: "ses-new", tool: "bash" } },
-  { type: "step_finish", part: { sessionID: "ses-new" } },
-];
-for (const l of lines) process.stdout.write(JSON.stringify(l) + "\\n");
+if (args.includes("--version")) {
+  process.stdout.write("1.99.0\\n");
+  process.exit(0);
+}
+
+if (args[0] !== "serve") {
+  process.stderr.write("unsupported subcommand\\n");
+  process.exit(1);
+}
+
+if (process.env.SPAWN_LOG_FILE) fs.appendFileSync(process.env.SPAWN_LOG_FILE, "spawn\\n");
+
+const password = process.env.OPENCODE_SERVER_PASSWORD || "";
+const config = JSON.parse(process.env.OPENCODE_TEST_CONFIG || "{}");
+const promptLogFile = process.env.PROMPT_LOG_FILE;
+const permissionLogFile = process.env.PERMISSION_LOG_FILE;
+
+const clients = [];
+
+function checkAuth(req, res) {
+  const expected = "Basic " + Buffer.from("opencode:" + password).toString("base64");
+  if (req.headers["authorization"] !== expected) {
+    res.writeHead(401);
+    res.end();
+    return false;
+  }
+  return true;
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", (c) => { data += c; });
+    req.on("end", () => {
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch (e) {
+        resolve({});
+      }
+    });
+  });
+}
+
+function broadcast(event) {
+  const line = "data: " + JSON.stringify(event) + "\\n\\n";
+  for (const res of clients) res.write(line);
+}
+
+function sendEventsFor(sessionId) {
+  const events = (config.eventsBySession && config.eventsBySession[sessionId]) || [];
+  let delay = 10;
+  for (const evt of events) {
+    setTimeout(() => broadcast(evt), delay);
+    delay += 15;
+  }
+}
+
+const server = http.createServer((req, res) => {
+  (async () => {
+    const parsed = urlMod.parse(req.url, true);
+    if (!checkAuth(req, res)) return;
+
+    if (parsed.pathname === "/event") {
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      res.write("data: " + JSON.stringify({ type: "server.connected", properties: {} }) + "\\n\\n");
+      clients.push(res);
+      req.on("close", () => {
+        const idx = clients.indexOf(res);
+        if (idx >= 0) clients.splice(idx, 1);
+      });
+      return;
+    }
+
+    if (parsed.pathname === "/session" && req.method === "POST") {
+      await readBody(req);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: config.createId || "ses-new" }));
+      return;
+    }
+
+    if (parsed.pathname.indexOf("/session/") === 0) {
+      const rest = parsed.pathname.slice("/session/".length);
+      const segments = rest.split("/");
+
+      if (segments.length === 2 && segments[1] === "fork" && req.method === "POST") {
+        await readBody(req);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: config.forkId || "ses-forked" }));
+        return;
+      }
+
+      if (segments.length === 2 && segments[1] === "prompt_async" && req.method === "POST") {
+        const body = await readBody(req);
+        const sessionId = segments[0];
+        if (promptLogFile) fs.appendFileSync(promptLogFile, JSON.stringify({ sessionId, body }) + "\\n");
+        res.writeHead(204);
+        res.end();
+        sendEventsFor(sessionId);
+        return;
+      }
+
+      if (segments.length === 3 && segments[1] === "permissions" && req.method === "POST") {
+        const body = await readBody(req);
+        if (permissionLogFile) {
+          fs.appendFileSync(permissionLogFile, JSON.stringify({ sessionId: segments[0], permissionId: segments[2], body }) + "\\n");
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({}));
+        return;
+      }
+    }
+
+    res.writeHead(404);
+    res.end();
+  })();
+});
+
+server.listen(0, "127.0.0.1", () => {
+  const port = server.address().port;
+  process.stdout.write("opencode server listening on http://127.0.0.1:" + port + "\\n");
+});
 `,
   );
+}
 
-  const adapter = createOpenCodeAdapter({ home, bin: cli });
-  process.env.ARGS_LOG_FILE = argsLog;
+function readNdjson(file) {
   try {
-    const events = await collect(adapter.send({ id: null, cwd: home, fork: false }, "hi", new AbortController().signal));
+    return readFileSync(file, "utf8")
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
+
+test("opencode send(): new session streams assistant text, a tool event, and auto-rejects a permission ask", async () => {
+  const home = makeTmpHome("opencode-warm-new-");
+  const promptLogFile = path.join(home, "prompts.ndjson");
+  const permissionLogFile = path.join(home, "permissions.ndjson");
+
+  const config = {
+    createId: "ses-warm-new",
+    eventsBySession: {
+      "ses-warm-new": [
+        { type: "message.updated", properties: { sessionID: "ses-warm-new", info: { id: "msg-user", role: "user" } } },
+        { type: "message.updated", properties: { sessionID: "ses-warm-new", info: { id: "msg-asst", role: "assistant" } } },
+        {
+          type: "message.part.updated",
+          properties: { part: { id: "prt-text", sessionID: "ses-warm-new", messageID: "msg-asst", type: "text", text: "" } },
+        },
+        {
+          type: "message.part.delta",
+          properties: { sessionID: "ses-warm-new", messageID: "msg-asst", partID: "prt-text", field: "text", delta: "Hello there" },
+        },
+        {
+          type: "message.part.updated",
+          properties: { part: { id: "prt-tool", sessionID: "ses-warm-new", messageID: "msg-asst", type: "tool", tool: "bash" } },
+        },
+        {
+          type: "permission.updated",
+          properties: { id: "perm-1", sessionID: "ses-warm-new", type: "bash", title: "run bash" },
+        },
+        { type: "session.idle", properties: { sessionID: "ses-warm-new" } },
+      ],
+    },
+  };
+
+  const adapter = createOpenCodeAdapter({ home, bin: writeFakeOpenCodeServer(home) });
+  process.env.OPENCODE_TEST_CONFIG = JSON.stringify(config);
+  process.env.PROMPT_LOG_FILE = promptLogFile;
+  process.env.PERMISSION_LOG_FILE = permissionLogFile;
+  try {
+    const events = await collect(
+      adapter.send({ id: null, cwd: "/tmp/opencode-warm-fixture", model: "anthropic/claude-3-opus", fork: false }, "hi", new AbortController().signal),
+    );
     assert.deepEqual(
       events.map((e) => e.type),
-      ["session", "delta", "tool", "done"],
+      ["session", "delta", "tool", "notice", "done"],
     );
-    assert.equal(events[0].id, "ses-new");
+    assert.equal(events[0].id, "ses-warm-new");
     assert.equal(events[1].text, "Hello there");
     assert.equal(events[2].name, "bash");
+    assert.match(events[3].message, /auto-rejected/);
 
-    const newArgs = readArgsLog(argsLog);
-    assert.ok(!newArgs.includes("-s"));
-    assert.ok(!newArgs.includes("--fork"));
-    assert.ok(newArgs.includes("run"));
+    const prompts = readNdjson(promptLogFile);
+    assert.equal(prompts.length, 1);
+    assert.equal(prompts[0].sessionId, "ses-warm-new");
+    assert.equal(prompts[0].body.parts[0].text, "hi");
+    assert.deepEqual(prompts[0].body.model, { providerID: "anthropic", modelID: "claude-3-opus" });
 
-    await collect(adapter.send({ id: "ses-1", cwd: home, fork: true }, "hi", new AbortController().signal));
-    const forkArgs = readArgsLog(argsLog);
-    assert.ok(forkArgs.includes("-s"));
-    assert.ok(forkArgs.includes("--fork"));
+    const permissionCalls = readNdjson(permissionLogFile);
+    assert.equal(permissionCalls.length, 1);
+    assert.equal(permissionCalls[0].permissionId, "perm-1");
+    assert.equal(permissionCalls[0].body.response, "reject");
   } finally {
-    delete process.env.ARGS_LOG_FILE;
+    delete process.env.OPENCODE_TEST_CONFIG;
+    delete process.env.PROMPT_LOG_FILE;
+    delete process.env.PERMISSION_LOG_FILE;
+  }
+});
+
+test("opencode send(): reuses an existing session id as-is, and hits the fork endpoint when forking", async () => {
+  const home = makeTmpHome("opencode-warm-reuse-");
+  const config = {
+    forkId: "ses-warm-forked",
+    eventsBySession: {
+      "ses-existing": [{ type: "session.idle", properties: { sessionID: "ses-existing" } }],
+      "ses-warm-forked": [{ type: "session.idle", properties: { sessionID: "ses-warm-forked" } }],
+    },
+  };
+
+  const adapter = createOpenCodeAdapter({ home, bin: writeFakeOpenCodeServer(home) });
+  process.env.OPENCODE_TEST_CONFIG = JSON.stringify(config);
+  try {
+    const reuseEvents = await collect(
+      adapter.send({ id: "ses-existing", cwd: "/tmp/opencode-warm-fixture", fork: false }, "hi", new AbortController().signal),
+    );
+    assert.equal(reuseEvents[0].type, "session");
+    assert.equal(reuseEvents[0].id, "ses-existing");
+
+    const forkEvents = await collect(
+      adapter.send({ id: "ses-existing", cwd: "/tmp/opencode-warm-fixture", fork: true }, "hi", new AbortController().signal),
+    );
+    assert.equal(forkEvents[0].type, "session");
+    assert.equal(forkEvents[0].id, "ses-warm-forked");
+  } finally {
+    delete process.env.OPENCODE_TEST_CONFIG;
+  }
+});
+
+test("opencode send(): surfaces session.error as an error event", async () => {
+  const home = makeTmpHome("opencode-warm-error-");
+  const config = {
+    createId: "ses-warm-err",
+    eventsBySession: {
+      "ses-warm-err": [
+        {
+          type: "session.error",
+          properties: { sessionID: "ses-warm-err", error: { name: "UnknownError", data: { message: "boom" } } },
+        },
+      ],
+    },
+  };
+
+  const adapter = createOpenCodeAdapter({ home, bin: writeFakeOpenCodeServer(home) });
+  process.env.OPENCODE_TEST_CONFIG = JSON.stringify(config);
+  try {
+    const events = await collect(
+      adapter.send({ id: null, cwd: "/tmp/opencode-warm-fixture", fork: false }, "hi", new AbortController().signal),
+    );
+    assert.deepEqual(
+      events.map((e) => e.type),
+      ["session", "error", "done"],
+    );
+    assert.equal(events[1].message, "boom");
+  } finally {
+    delete process.env.OPENCODE_TEST_CONFIG;
+  }
+});
+
+test("opencode send(): reuses one warm `opencode serve` process across turns", async () => {
+  const home = makeTmpHome("opencode-warm-reuse-proc-");
+  const spawnLogFile = path.join(home, "spawns.log");
+  const config = {
+    createId: "ses-a",
+    eventsBySession: {
+      "ses-a": [{ type: "session.idle", properties: { sessionID: "ses-a" } }],
+    },
+  };
+
+  const adapter = createOpenCodeAdapter({ home, bin: writeFakeOpenCodeServer(home) });
+  process.env.OPENCODE_TEST_CONFIG = JSON.stringify(config);
+  process.env.SPAWN_LOG_FILE = spawnLogFile;
+  try {
+    await collect(adapter.send({ id: null, cwd: "/tmp/opencode-warm-fixture", fork: false }, "hi", new AbortController().signal));
+    await collect(adapter.send({ id: "ses-a", cwd: "/tmp/opencode-warm-fixture", fork: false }, "hi again", new AbortController().signal));
+
+    const spawns = readFileSync(spawnLogFile, "utf8").trim().split("\n").filter(Boolean);
+    assert.equal(spawns.length, 1);
+  } finally {
+    delete process.env.OPENCODE_TEST_CONFIG;
+    delete process.env.SPAWN_LOG_FILE;
   }
 });
 

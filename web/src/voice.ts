@@ -9,7 +9,14 @@ function plainSpeech(text: string) {
     .trim();
 }
 
-function speechBoundary(text: string): number {
+// A slow (e.g. CPU) TTS backend makes the very first spoken unit of a turn
+// the dominant contributor to perceived latency: nothing is audible until it
+// is fully synthesized. So the first chunk of a turn is allowed to end at a
+// clause boundary (comma/semicolon/colon) or a short word-count cap, instead
+// of waiting for a full sentence like every later chunk does. Later chunks
+// keep the sentence-level boundary because SpeechPipeline coalesces them
+// into larger TTS requests anyway once the first phrase is already playing.
+function speechBoundary(text: string, early: boolean): number {
   let fence = false;
   let inline = false;
   let brackets = 0;
@@ -37,37 +44,48 @@ function speechBoundary(text: string): number {
     }
     if (brackets) continue;
 
-    const punctuation = /[.!?。！？]/.test(text[index]);
-    const boundary = punctuation && (/[。！？]/.test(text[index]) || /\s/.test(text[index + 1] || ""));
+    const punctuation = /[.!?。！？]/.test(text[index]) || (early && /[,;:，；：]/.test(text[index]));
+    const boundary = punctuation && (/[。！？，；：]/.test(text[index]) || /\s/.test(text[index + 1] || ""));
     const abbreviation = text[index] === "." && /(?:\b(?:Mr|Mrs|Ms|Dr|Prof|St|vs|etc)|\b[A-Za-z])\.$/i.test(text.slice(0, index + 1));
-    if ((boundary && !abbreviation) || text[index] === "\n" || text[index] === "—" || (index >= 160 && /\s/.test(text[index]))) {
+    const lengthCap = early ? 48 : 160;
+    if ((boundary && !abbreviation) || text[index] === "\n" || text[index] === "—" || (index >= lengthCap && /\s/.test(text[index]))) {
       return index + 1;
     }
   }
   return 0;
 }
 
-function phraseBoundary(text: string, done: boolean): number {
+function phraseBoundary(text: string, done: boolean, early: boolean): number {
   let end = 0;
   while (end < text.length) {
-    const boundary = speechBoundary(text.slice(end)) || (done ? text.length - end : 0);
+    const boundary = speechBoundary(text.slice(end), early) || (done ? text.length - end : 0);
     if (!boundary) return 0;
     end += boundary;
     const words = plainSpeech(text.slice(0, end).replace(/—/g, " ")).match(/[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*/gu)?.length ?? 0;
-    if (words > 3 || (done && end === text.length)) return end;
+    const minWords = early ? 5 : 3;
+    if (words > minWords || (done && end === text.length)) return end;
   }
   return 0;
 }
 
-/** Consume stable phrase boundaries once and retain the unfinished tail. */
-export function consumeSpeechChunks(text: string, done = false) {
+/**
+ * Consume stable phrase boundaries once and retain the unfinished tail.
+ * When `first` is set, the earliest chunk in this call is allowed to break
+ * at a short clause (≈6-10 words) so the first sentence reaches TTS as soon
+ * as possible; every chunk after that reverts to full-sentence boundaries.
+ */
+export function consumeSpeechChunks(text: string, done = false, first = false) {
   const chunks: string[] = [];
   let offset = 0;
+  let early = first;
   while (offset < text.length) {
-    const end = phraseBoundary(text.slice(offset), done);
+    const end = phraseBoundary(text.slice(offset), done, early);
     if (!end) break;
     const spoken = plainSpeech(text.slice(offset, offset + end).replace(/—$/, "").replace(/—/g, ", "));
-    if (spoken) chunks.push(spoken);
+    if (spoken) {
+      chunks.push(spoken);
+      early = false;
+    }
     offset += end;
   }
   return { chunks, rest: done ? "" : text.slice(offset) };
