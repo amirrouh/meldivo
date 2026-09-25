@@ -9,9 +9,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import express from "express";
 import { createAdapters, listAllSessions } from "./harnesses/index.js";
 import type { HarnessAdapter, HarnessId, SendTarget, SessionInfo, TurnEvent } from "./harnesses/types.js";
-import { createAccessGate } from "./access.js";
+import { createAccessGate, notFound } from "./access.js";
 import { createLogger, requestLoggingMiddleware } from "./logger.js";
-import { fetchPeerSnapshot, loadPeers, parsePeerKey, peerCancel, peerChat, type Peer, type PeerSnapshot } from "./peers.js";
+import { createHub, hubSpeech, type Hub, type TurnSink } from "./hub.js";
+import { loadHubLink, startMachineClient, type HubLink, type MachineClient } from "./machine-client.js";
+import { MACHINE_NAME, parseMachineKey } from "./protocol.js";
 import { detectRemoteOptions, RemoteManager, remoteGuideUrl, type RemoteId } from "./remote.js";
 import { createSherpaEngine, type SpeechEngine } from "./speech.js";
 import { defaultStateDir, SessionStateStore } from "./state.js";
@@ -33,14 +35,26 @@ export interface StartServerOptions {
   webDir?: string;
   stateDir?: string;
   httpsPort?: number;
-  /** Other machines' hubs to show and drive from this one (default: ~/.config/meldivo/peers.json). */
-  peers?: () => Peer[];
+  /** Where hub keys, machines.json, and hub.json live (default: ~/.config/meldivo). */
+  configDir?: string;
+  /** Run as a hub that other machines join (see hub.ts). */
+  hub?: boolean;
+  /** The hub this machine joined; default: hub.json in configDir, null for none. */
+  hubLink?: HubLink | null;
+  /** Reported to the hub by a joined machine. */
+  version?: string;
+  /** Load the speech models in the background at startup (a hub waits to see if a speech machine joins first). */
+  warmupSpeech?: boolean;
+}
+
+function defaultConfigDir(): string {
+  const base = process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config");
+  return path.join(base, "meldivo");
 }
 
 // Where a user-supplied TLS certificate for remote access lives.
 function tlsDir(): string {
-  const base = process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config");
-  return path.join(base, "meldivo", "tls");
+  return path.join(defaultConfigDir(), "tls");
 }
 
 // The lock that keeps only one browser tab recording at a time. It is a
@@ -73,7 +87,6 @@ type SessionsSnapshot = {
   at: number;
   harnesses: { id: HarnessId; label: string; available: boolean }[];
   sessions: SessionInfo[];
-  peers: PeerSnapshot[];
 };
 
 type AttemptOutcome = "committed" | "failed";
@@ -81,7 +94,7 @@ type AttemptOutcome = "committed" | "failed";
 export async function startServer(options: StartServerOptions): Promise<{ port: number; close(): Promise<void> }> {
   const host = options.host ?? "127.0.0.1";
   const secret = options.secret;
-  const speech = options.speech ?? createSherpaEngine();
+  const localSpeech = options.speech ?? createSherpaEngine();
   const webDir = options.webDir ?? fileURLToPath(new URL("../web", import.meta.url));
   const stateDir = options.stateDir ?? defaultStateDir();
   const logger = createLogger();
@@ -92,7 +105,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       adapter.warmup?.().catch((error: unknown) => console.error(`${adapter.id} warmup failed:`, error));
     }
   }
-  const listPeers = options.peers ?? (() => loadPeers());
+  const configDir = options.configDir ?? defaultConfigDir();
   const adapterById = new Map(adapters.map((adapter) => [adapter.id, adapter]));
   const stateStore = new SessionStateStore(stateDir);
   const voiceLease = new VoiceLease(VOICE_LEASE_TTL_MS);
@@ -107,13 +120,25 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   app.use(requestLoggingMiddleware(logger));
   app.use(express.json({ limit: "1mb" }));
 
-  // Nothing is served without the secret: not the page, not even health (see access.ts).
+  // Nothing is served without the secret: not the page, not even health (see access.ts). The
+  // only exceptions authenticate on their own: unlock (the secret) and a machine joining this
+  // hub (a one-time code); both answer anything invalid with the same plain 404.
   const gate = createAccessGate(secret);
+  const hub: Hub | undefined = options.hub ? createHub({ configDir, logger, notFound }) : undefined;
+  const speech = hub ? hubSpeech(localSpeech, hub, logger) : localSpeech;
+  if (options.warmupSpeech) {
+    const warm = () => localSpeech.warmup?.().catch((error: unknown) => console.error("speech warmup failed:", error));
+    // A hub with a speech machine never needs its own models, so give machines time to connect.
+    if (hub) setTimeout(() => { if (!hub.speechMachine()) void warm(); }, 30_000).unref();
+    else void warm();
+  }
+  let machineClient: MachineClient | undefined;
   app.post("/api/unlock", gate.unlock);
+  if (hub) app.post("/api/hub/join", hub.join);
   app.use(gate.middleware);
 
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, speech: speech.status() });
+    res.json({ ok: true, speech: speech.status(), hub: Boolean(hub), joined: machineClient?.status() });
   });
 
   async function enableHttps(): Promise<number> {
@@ -126,6 +151,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     const cert = readFileSync(certPath);
     const key = readFileSync(keyPath);
     const server = createHttpsServer({ cert, key }, app);
+    hub?.attach(server);
     await new Promise<void>((resolve, reject) => {
       server.listen(options.httpsPort ?? 4443, "0.0.0.0", () => resolve());
       server.once("error", reject);
@@ -154,31 +180,31 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
 
   async function getSessionsSnapshot(): Promise<SessionsSnapshot> {
     if (sessionsSnapshot && Date.now() - sessionsSnapshot.at < SESSIONS_CACHE_MS) return sessionsSnapshot;
-    const [sessions, availability, forkIds, peers] = await Promise.all([
+    const [sessions, availability, forkIds] = await Promise.all([
       listAllSessions(adapters, SESSIONS_LIMIT),
       Promise.all(adapters.map(async (adapter) => ({ id: adapter.id, label: adapter.label, available: await adapter.available() }))),
       stateStore.allForkIds(),
-      Promise.all(listPeers().map(fetchPeerSnapshot)),
     ]);
     // Voice forks are an implementation detail of continuing an open session;
     // hide them from the list so they don't show up as extra sessions.
     const visible = sessions.filter((session) => !forkIds.has(session.id));
-    sessionsSnapshot = { at: Date.now(), harnesses: availability, sessions: visible, peers };
+    sessionsSnapshot = { at: Date.now(), harnesses: availability, sessions: visible };
     return sessionsSnapshot;
   }
 
   app.get("/api/sessions", async (_req, res) => {
     const snapshot = await getSessionsSnapshot();
     const machine = hostname();
-    // `machine`/`harnesses` describe this hub; `hosts` adds every peer, and peer sessions
-    // carry `host` plus a key prefixed with `@<host>/`.
+    // `machine`/`harnesses` describe this machine; on a hub, `hosts` adds every joined machine,
+    // whose sessions carry `host` plus a key prefixed with `@<machine>/`.
+    const joined = hub?.hosts() ?? [];
     res.set("Cache-Control", "no-store").json({
       machine,
       harnesses: snapshot.harnesses,
-      sessions: [...snapshot.sessions, ...snapshot.peers.flatMap((peer) => peer.sessions)],
+      sessions: [...snapshot.sessions, ...joined.flatMap((host) => host.sessions)],
       hosts: [
         { id: "", name: machine, online: true, harnesses: snapshot.harnesses },
-        ...snapshot.peers.map((peer) => ({ id: peer.name, name: peer.name, machine: peer.machine, online: peer.online, harnesses: peer.harnesses })),
+        ...joined.map((host) => ({ id: host.id, name: host.name, online: host.online, harnesses: host.harnesses })),
       ],
     });
   });
@@ -193,16 +219,10 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     target: SendTarget,
     message: string,
     signal: AbortSignal,
-    res: express.Response,
+    sink: TurnSink,
     opts: {
       allowFallback?: boolean;
       onSessionId?: (id: string) => void | Promise<void>;
-      // Fired the instant the session id is known, mid-stream, well before the
-      // turn ends. Lets the caller register an alias for cancellation: a
-      // "new:<harness>" turn's client learns the resolved key from this same
-      // event and switches to it immediately, so /cancel must find the turn
-      // under either the original request key or the resolved one.
-      onLiveSessionId?: (id: string) => void;
     } = {},
   ): Promise<AttemptOutcome> {
     const allowFallback = opts.allowFallback ?? false;
@@ -220,18 +240,15 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     };
     const endWith = async (terminal: TurnEvent): Promise<void> => {
       await persist();
-      flush(res, buffered);
+      flush(sink, buffered);
       buffered.length = 0;
-      sendEvent(res, terminal);
-      if (!res.writableEnded) res.end();
+      sink.send(terminal);
+      if (!sink.ended) sink.end();
     };
 
     try {
       for await (const event of adapter.send(target, message, signal)) {
-        if (event.type === "session") {
-          sessionId = event.id;
-          opts.onLiveSessionId?.(event.id);
-        }
+        if (event.type === "session") sessionId = event.id;
         if (event.type === "delta") sawDelta = true;
 
         if (allowFallback && !sawDelta) {
@@ -250,10 +267,10 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
         }
 
         if (buffered.length > 0) {
-          flush(res, buffered);
+          flush(sink, buffered);
           buffered.length = 0;
         }
-        sendEvent(res, event);
+        sink.send(event);
       }
       // Defensive: the generator ended without an explicit done/error event.
       await endWith({ type: "done" });
@@ -265,12 +282,12 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     }
   }
 
-  async function runQuick(message: string, conversationId: string | undefined, signal: AbortSignal, res: express.Response): Promise<void> {
+  async function runQuick(message: string, conversationId: string | undefined, signal: AbortSignal, sink: TurnSink): Promise<void> {
     const conversation = conversationId ? await stateStore.getConversation(conversationId) : undefined;
     if (conversation) {
       const adapter = adapterById.get(conversation.harness as HarnessId);
       if (adapter) {
-        await attempt(adapter, { id: conversation.id, cwd: homeDir, fork: false }, message, signal, res, {
+        await attempt(adapter, { id: conversation.id, cwd: homeDir, fork: false }, message, signal, sink, {
           onSessionId: (id) => (conversationId ? stateStore.setConversation(conversationId, { harness: adapter.id, id }) : undefined),
         });
         return;
@@ -283,21 +300,21 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       if (adapter && (await adapter.available())) candidates.push(adapter);
     }
     if (candidates.length === 0) {
-      sendEvent(res, { type: "error", message: "No coding-agent CLI is available on this machine" });
-      res.end();
+      sink.send({ type: "error", message: "No coding-agent CLI is available on this machine" });
+      sink.end();
       return;
     }
 
     for (let index = 0; index < candidates.length; index++) {
       const adapter = candidates[index]!;
       const isLast = index === candidates.length - 1;
-      const outcome = await attempt(adapter, { id: null, cwd: homeDir, fork: false }, message, signal, res, {
+      const outcome = await attempt(adapter, { id: null, cwd: homeDir, fork: false }, message, signal, sink, {
         allowFallback: !isLast,
         onSessionId: (id) => (conversationId ? stateStore.setConversation(conversationId, { harness: adapter.id, id }) : undefined),
       });
       if (outcome === "committed") return;
       const next = candidates[index + 1]!;
-      sendEvent(res, { type: "status", message: `${adapter.label} unavailable, using ${next.label}` });
+      sink.send({ type: "status", message: `${adapter.label} unavailable, using ${next.label}` });
     }
   }
 
@@ -306,13 +323,12 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     message: string,
     conversationId: string | undefined,
     signal: AbortSignal,
-    res: express.Response,
-    onLiveSessionId?: (id: string) => void,
+    sink: TurnSink,
   ): Promise<void> {
     const adapter = adapterById.get(harness);
     if (!adapter) {
-      sendEvent(res, { type: "error", message: `Unknown harness "${harness}"` });
-      res.end();
+      sink.send({ type: "error", message: `Unknown harness "${harness}"` });
+      sink.end();
       return;
     }
     let id: string | null = null;
@@ -320,9 +336,8 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       const conversation = await stateStore.getConversation(conversationId);
       if (conversation && conversation.harness === harness) id = conversation.id;
     }
-    await attempt(adapter, { id, cwd: homeDir, fork: false }, message, signal, res, {
+    await attempt(adapter, { id, cwd: homeDir, fork: false }, message, signal, sink, {
       onSessionId: (sessionId) => (conversationId ? stateStore.setConversation(conversationId, { harness, id: sessionId }) : undefined),
-      onLiveSessionId,
     });
   }
 
@@ -336,62 +351,81 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     return deeper.find((session) => session.id === id);
   }
 
-  async function runExisting(key: string, harness: HarnessId, id: string, message: string, signal: AbortSignal, res: express.Response): Promise<void> {
+  async function runExisting(key: string, harness: HarnessId, id: string, message: string, signal: AbortSignal, sink: TurnSink): Promise<void> {
     const adapter = adapterById.get(harness);
     if (!adapter) {
-      sendEvent(res, { type: "error", message: `Unknown harness "${harness}"` });
-      res.end();
+      sink.send({ type: "error", message: `Unknown harness "${harness}"` });
+      sink.end();
       return;
     }
     const info = await findSession(harness, id);
     if (!info) {
-      sendEvent(res, { type: "error", message: "Session not found" });
-      res.end();
+      sink.send({ type: "error", message: "Session not found" });
+      sink.end();
       return;
     }
 
     if (info.open) {
       const forkId = await stateStore.getFork(key);
       if (forkId) {
-        await attempt(adapter, { id: forkId, cwd: info.cwd, model: info.model, fork: false }, message, signal, res);
+        await attempt(adapter, { id: forkId, cwd: info.cwd, model: info.model, fork: false }, message, signal, sink);
       } else {
-        await attempt(adapter, { id: info.id, cwd: info.cwd, model: info.model, fork: true }, message, signal, res, {
+        await attempt(adapter, { id: info.id, cwd: info.cwd, model: info.model, fork: true }, message, signal, sink, {
           onSessionId: (newId) => stateStore.setFork(key, newId),
         });
       }
     } else {
-      await attempt(adapter, { id: info.id, cwd: info.cwd, model: info.model, fork: false }, message, signal, res);
+      await attempt(adapter, { id: info.id, cwd: info.cwd, model: info.model, fork: false }, message, signal, sink);
     }
   }
 
-  // Relays one turn to a peer hub and streams its events back unchanged.
-  async function runPeer(name: string, key: string, message: string, conversationId: string | undefined, signal: AbortSignal, res: express.Response): Promise<void> {
-    const peer = listPeers().find((candidate) => candidate.name === name);
-    if (!peer) {
-      sendEvent(res, { type: "error", message: `Unknown machine "${name}"` });
-      res.end();
-      return;
-    }
-    let upstream: Response;
+  // Runs one turn for a session key, from the browser (SSE) or from the hub this machine
+  // joined, and keeps it cancellable under its key. A "new:<harness>" turn's client learns the
+  // resolved "<harness>:<id>" key from the "session" event, well before the turn ends, and
+  // switches to it immediately (including for a barge-in /cancel sent mid-turn), so the
+  // resolved key is registered for the same controller. Keys of a joined machine's sessions
+  // ("@<machine>/...") are relayed to that machine.
+  async function runTurn(key: string, message: string, conversationId: string | undefined, controller: AbortController, sink: TurnSink): Promise<void> {
+    activeTurns.set(key, controller);
+    const target = parseMachineKey(key);
+    const inner = target ? target.inner : key;
+    const prefix = target ? key.slice(0, key.length - inner.length) : "";
+    let aliasKey: string | undefined;
+    const tracked: TurnSink = {
+      send(event) {
+        if (event.type === "session" && inner.startsWith("new:") && !aliasKey) {
+          aliasKey = `${prefix}${inner.slice(4)}:${event.id}`;
+          if (!activeTurns.has(aliasKey)) activeTurns.set(aliasKey, controller);
+        }
+        sink.send(event);
+      },
+      end: () => sink.end(),
+      get ended() { return sink.ended; },
+    };
     try {
-      upstream = await peerChat(peer, key, { message, conversationId }, signal);
-    } catch {
-      if (!signal.aborted) sendEvent(res, { type: "error", message: `${name} is unreachable` });
-      res.end();
-      return;
+      if (target) {
+        if (hub) await hub.relay(target.name, target.inner, message, conversationId, controller.signal, tracked);
+        else {
+          tracked.send({ type: "error", message: "Session not found" });
+          tracked.end();
+        }
+      } else if (key === "quick") {
+        await runQuick(message, conversationId, controller.signal, tracked);
+      } else if (key.startsWith("new:")) {
+        await runNew(key.slice(4) as HarnessId, message, conversationId, controller.signal, tracked);
+      } else {
+        const sep = key.indexOf(":");
+        if (sep < 0) {
+          tracked.send({ type: "error", message: "Invalid session key" });
+          tracked.end();
+        } else {
+          await runExisting(key, key.slice(0, sep) as HarnessId, key.slice(sep + 1), message, controller.signal, tracked);
+        }
+      }
+    } finally {
+      if (activeTurns.get(key) === controller) activeTurns.delete(key);
+      if (aliasKey && activeTurns.get(aliasKey) === controller) activeTurns.delete(aliasKey);
     }
-    if (!upstream.ok || !upstream.body) {
-      const body = await upstream.json().catch(() => ({})) as { error?: unknown };
-      sendEvent(res, { type: "error", message: typeof body.error === "string" ? body.error : `${name} returned ${upstream.status}` });
-      res.end();
-      return;
-    }
-    try {
-      for await (const chunk of upstream.body) res.write(chunk);
-    } catch {
-      if (!signal.aborted) sendEvent(res, { type: "error", message: `Lost the connection to ${name}` });
-    }
-    if (!res.writableEnded) res.end();
   }
 
   app.post("/api/sessions/:key/chat", async (req, res) => {
@@ -402,7 +436,6 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     const conversationId = readConversationId(req.body?.conversationId);
 
     const controller = new AbortController();
-    activeTurns.set(key, controller);
     req.on("aborted", () => controller.abort());
     res.on("close", () => {
       if (!res.writableEnded) controller.abort();
@@ -415,58 +448,38 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       "X-Accel-Buffering": "no",
     });
     res.flushHeaders();
-
-    // A "new:<harness>" turn tells its client the resolved "<harness>:<id>" key
-    // as soon as the underlying session id is known (see the "session" SSE
-    // event), well before the turn ends. The client switches to that key
-    // immediately, including for a barge-in /cancel sent mid-turn - so the
-    // resolved key must also resolve to this same controller.
-    let aliasKey: string | undefined;
-    const registerAlias = (id: string) => {
-      aliasKey = `${key.slice(4)}:${id}`;
-      if (!activeTurns.has(aliasKey)) activeTurns.set(aliasKey, controller);
+    const sink: TurnSink = {
+      send: (event) => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(event)}\n\n`); },
+      end: () => { if (!res.writableEnded) res.end(); },
+      get ended() { return res.writableEnded; },
     };
-
-    try {
-      const peerTarget = parsePeerKey(key);
-      if (peerTarget) {
-        await runPeer(peerTarget.name, peerTarget.inner, message, conversationId, controller.signal, res);
-      } else if (key === "quick") {
-        await runQuick(message, conversationId, controller.signal, res);
-      } else if (key.startsWith("new:")) {
-        await runNew(key.slice(4) as HarnessId, message, conversationId, controller.signal, res, registerAlias);
-      } else {
-        const sep = key.indexOf(":");
-        if (sep < 0) {
-          sendEvent(res, { type: "error", message: "Invalid session key" });
-          res.end();
-        } else {
-          await runExisting(key, key.slice(0, sep) as HarnessId, key.slice(sep + 1), message, controller.signal, res);
-        }
-      }
-    } finally {
-      if (activeTurns.get(key) === controller) activeTurns.delete(key);
-      if (aliasKey && activeTurns.get(aliasKey) === controller) activeTurns.delete(aliasKey);
-    }
+    await runTurn(key, message, conversationId, controller, sink);
+    sink.end();
   });
 
-  app.post("/api/sessions/:key/cancel", async (req, res) => {
+  app.post("/api/sessions/:key/cancel", (req, res) => {
     const key = req.params.key!;
     const controller = activeTurns.get(key);
-    if (controller) {
-      // For a peer turn, closing the relayed request cancels it on the peer too.
-      controller.abort();
-      return res.status(204).end();
-    }
-    const peerTarget = parsePeerKey(key);
-    const peer = peerTarget && listPeers().find((candidate) => candidate.name === peerTarget.name);
-    if (peerTarget && peer) {
-      // A resolved key the peer registered mid-turn (see registerAlias) is only known there.
-      const upstream = await peerCancel(peer, peerTarget.inner).catch(() => undefined);
-      return res.status(upstream?.status === 204 ? 204 : 404).end();
-    }
-    res.status(404).json({ error: "No active turn for this session" });
+    if (!controller) return res.status(404).json({ error: "No active turn for this session" });
+    // For a joined machine's turn, the hub forwards the cancel to that machine.
+    controller.abort();
+    res.status(204).end();
   });
+
+  // Hub administration (used by `meldivo hub ...`); only exists when this is a hub.
+  if (hub) {
+    app.get("/api/hub/machines", (_req, res) => {
+      res.set("Cache-Control", "no-store").json({ machines: hub.machines() });
+    });
+    app.post("/api/hub/codes", (_req, res) => {
+      res.set("Cache-Control", "no-store").status(201).json(hub.createJoinCode());
+    });
+    app.delete("/api/hub/machines/:name", (req, res) => {
+      const name = req.params.name!;
+      if (!MACHINE_NAME.test(name) || !hub.remove(name)) return res.status(404).json({ error: "No such machine" });
+      res.status(204).end();
+    });
+  }
 
   app.get("/api/remote", (_req, res) => {
     res.set("Cache-Control", "no-store").json({ options: detectRemoteOptions(), active: remoteManager.status().active, guide: remoteGuideUrl });
@@ -551,21 +564,45 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     httpServer = app.listen(options.port ?? 0, host, () => resolve());
     httpServer.once("error", reject);
   });
+  hub?.attach(httpServer!);
   const actualPort = (httpServer!.address() as AddressInfo).port;
   const extraServers: Server[] = [];
   for (const extraHost of options.extraHosts ?? []) {
     await new Promise<void>((resolve, reject) => {
       const extra = app.listen(actualPort, extraHost, () => resolve());
       extra.once("error", reject);
+      hub?.attach(extra);
       extraServers.push(extra);
     });
   }
   (remoteManager as unknown as { opts: { httpPort: number } }).opts.httpPort = actualPort;
-  logger.info("server_started", { host, extraHosts: (options.extraHosts ?? []).join(","), port: actualPort });
+  logger.info("server_started", { host, extraHosts: (options.extraHosts ?? []).join(","), port: actualPort, hub: Boolean(hub) });
+
+  const hubLink = options.hubLink === undefined ? loadHubLink(configDir) : options.hubLink ?? undefined;
+  if (hubLink) {
+    machineClient = startMachineClient({
+      link: hubLink,
+      logger,
+      version: options.version ?? "unknown",
+      snapshot: async () => {
+        const snapshot = await getSessionsSnapshot();
+        return { harnesses: snapshot.harnesses, sessions: snapshot.sessions };
+      },
+      isBusy: (key) => activeTurns.has(key),
+      speech: localSpeech,
+      runTurn: (key, message, conversationId, signal, sink) => {
+        const controller = new AbortController();
+        signal.addEventListener("abort", () => controller.abort(), { once: true });
+        return runTurn(key, message, conversationId, controller, sink);
+      },
+    });
+  }
 
   async function close(): Promise<void> {
     for (const controller of activeTurns.values()) controller.abort();
     activeTurns.clear();
+    machineClient?.close();
+    hub?.close();
     await Promise.all([
       ...[httpServer, ...extraServers].map((server) => new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
@@ -578,8 +615,8 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   return { port: actualPort, close };
 }
 
-function flush(res: express.Response, events: TurnEvent[]): void {
-  for (const event of events) sendEvent(res, event);
+function flush(sink: TurnSink, events: TurnEvent[]): void {
+  for (const event of events) sink.send(event);
 }
 
 
@@ -613,10 +650,6 @@ function readRemoteId(value: unknown): RemoteId | undefined {
   return value === "tailscale" || value === "cloudflare" || value === "certificate" ? value : undefined;
 }
 
-function sendEvent(res: express.Response, event: TurnEvent | { type: "status"; message: string }): void {
-  res.write(`data: ${JSON.stringify(event)}\n\n`);
-}
-
 function abortOnDisconnect(req: express.Request, res: express.Response): AbortController {
   const controller = new AbortController();
   req.on("aborted", () => controller.abort());
@@ -641,9 +674,18 @@ if (isMainModule) {
   const modelsDir = process.env.MELDIVO_MODELS_DIR?.trim() || undefined;
   const speech = createSherpaEngine(modelsDir ? { modelsDir } : undefined);
   const extraHosts = (process.env.MELDIVO_HOST ?? "").split(",").map((value) => value.trim()).filter((value) => value && value !== "127.0.0.1");
-  void startServer({ port, host: "127.0.0.1", extraHosts, secret, publicUrl, speech, httpsPort });
-  // Download and load the voice models in the background so the first turn is fast.
-  speech.warmup?.().catch((error: unknown) => console.error("speech warmup failed:", error));
+  const hub = process.env.MELDIVO_HUB === "1";
+  const version = readVersion();
+  // Speech models download and load in the background (warmupSpeech) so the first turn is fast.
+  void startServer({ port, host: "127.0.0.1", extraHosts, secret, publicUrl, speech, httpsPort, hub, version, warmupSpeech: true });
+}
+
+function readVersion(): string {
+  try {
+    return (JSON.parse(readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8")) as { version?: string }).version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function numberEnv(name: string, fallback: number): number {

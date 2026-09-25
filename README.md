@@ -77,7 +77,11 @@ project.
 | `meldivo remote cloudflare` | Publish the hub through a Cloudflare quick tunnel. |
 | `meldivo remote certificate` | Publish the hub over HTTPS using your own certificate. |
 | `meldivo remote stop` | Turn remote access off. |
-| `meldivo peer add <name> <link>` | Show another machine's hub (and its sessions) in this one. `meldivo peer` lists peers; `meldivo peer remove <name>` removes one. |
+| `meldivo hub enable` | Make this machine a hub that your other machines join. `meldivo hub disable` turns it off. |
+| `meldivo hub code` | Print a one-time code (10 minutes, single use) and the `meldivo join` command for adding a machine. |
+| `meldivo hub machines` | List the machines that joined this hub. `meldivo hub remove <name>` removes one at once. |
+| `meldivo join <hub-address> <code>` | Join a hub, so this machine's sessions appear there. Options: `--name <name>`, `--allow pi,opencode,claude`, `--speech` (also do speech for the hub). |
+| `meldivo leave` | Leave the hub this machine joined. |
 | `meldivo logs` | Show the service's recent log output. |
 | `meldivo uninstall [--purge]` | Remove the background service. `--purge` also deletes configuration, models, and logs. |
 | `meldivo --version` | Print the installed version. |
@@ -101,28 +105,42 @@ how to trust a certificate on iPhone and Android.
 
 ## Several machines, one hub
 
-Install meldivo on each machine, pick one as the main hub, and add the others
-to it as peers. The main hub then lists every machine with its own new-chat
-tiles and sessions, all behind the main hub's single link. Speech runs on the
-main hub; only the text of each turn travels to the other machine.
+If you use coding agents on more than one computer, make one of them (or a
+small always-on box such as a Raspberry Pi) a **hub**. Every other machine
+joins it and keeps an outbound connection to it, so those machines need no
+open ports. The hub's single link then lists every machine with its sessions
+and new-chat tiles. Only the text of each turn goes to the machine that runs
+it. Speech runs on the hub, or on a faster machine that joins with `--speech`,
+which is recommended when the hub is a small computer.
 
-Peers must be reachable from the main hub over a private network such as a
-VPN. On each other machine:
-
-```sh
-MELDIVO_HOST=<vpn-ip> meldivo start   # also listen on the VPN address
-meldivo open                          # prints "Also on http://<vpn-ip>:4100/#token=..."
-```
-
-Then on the main hub:
+On the hub:
 
 ```sh
-meldivo peer add workstation 'http://<vpn-ip>:4100/#token=...'
+meldivo hub enable       # prints the hub link
+meldivo hub code         # prints a one-time code and the join command
 ```
 
-Peer links are stored in `~/.config/meldivo/peers.json`, readable only by you.
-Never put a peer on a public address: the main hub's link now controls every
-machine it lists.
+On each other machine (with meldivo installed and started):
+
+```sh
+meldivo join http://<hub-address>:4100 <code>
+```
+
+The hub address must be reachable from that machine, ideally over a private
+network such as a VPN: set `MELDIVO_HOST=<vpn-ip>` when starting the hub so it
+also listens there. See the [self-hosting guide](docs/self-hosting-hub.md) for
+a full walkthrough, including running the hub on a Raspberry Pi.
+
+How it stays private:
+
+- A machine joins only with a one-time code, and gets its own credential; the
+  hub stores only a hash of it. `meldivo hub remove <name>` cuts a machine off
+  immediately.
+- The hub proves its identity on every connection with a key the machine
+  pinned when it joined, so a machine never talks to a look-alike hub.
+- The hub can only ask a machine to run or cancel a text turn in one of its
+  own sessions, never a command. `--allow` limits which agents it may use.
+- Session lists are kept in memory on the hub, never written to disk.
 
 ## How it works
 
@@ -144,7 +162,7 @@ All settings are optional.
 | `MELDIVO_PORT` | `4100` | Port of the local server (`127.0.0.1` only). |
 | `MELDIVO_HTTPS_PORT` | `4443` | HTTPS port used by the "own certificate" remote option. |
 | `MELDIVO_PUBLIC_URL` | unset | Base URL to print when you run your own reverse proxy. |
-| `MELDIVO_HOST` | unset | Extra addresses to listen on besides `127.0.0.1` (comma-separated), e.g. a VPN address your reverse proxy forwards to. |
+| `MELDIVO_HOST` | unset | Extra addresses to listen on besides `127.0.0.1` (comma-separated), e.g. a VPN address that joined machines or your reverse proxy connect to. |
 | `MELDIVO_MODELS_DIR` | `~/.cache/meldivo/models` | Location of the downloaded speech models. |
 
 ## Files and locations
@@ -152,7 +170,8 @@ All settings are optional.
 | Path | Contents |
 |---|---|
 | `~/.config/meldivo/secret` | The hub's shared secret, generated automatically. |
-| `~/.config/meldivo/peers.json` | Other machines' hubs shown in this one, with their keys. |
+| `~/.config/meldivo/hub.json` | On a machine that joined a hub: the hub's address, this machine's credential, and the hub's pinned key. |
+| `~/.config/meldivo/machines.json`, `hub-key.pem` | On a hub: joined machines (names and credential hashes) and the hub's signing key. |
 | `~/.cache/meldivo/models` | Downloaded speech models. |
 | `~/.local/state/meldivo` | Service logs and runtime state. |
 
@@ -162,7 +181,7 @@ The server listens on `127.0.0.1` only; it is never exposed on the network
 unless you explicitly turn on phone access. Every hub link, local or remote,
 embeds a random token, and requests without it are rejected. Treat the hub
 link like a password: anyone who has it can use every session in the hub,
-including the sessions of every peer machine added to it.
+including the sessions of every machine that joined it.
 
 ## Uninstall
 

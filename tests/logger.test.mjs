@@ -19,6 +19,9 @@ test("structured logs keep operational fields and redact sensitive field names",
       transcript: "never-log-me",
       audio: "never-log-me",
       request_body: "never-log-me",
+      credential: "never-log-me",
+      join_code: "never-log-me",
+      session_title: "never-log-me",
     });
   } finally {
     console.log = originalLog;

@@ -42,8 +42,8 @@ function runtimePath() {
   return path.join(configDir(), "runtime.json");
 }
 
-function peersPath() {
-  return path.join(configDir(), "peers.json");
+function hubLinkPath() {
+  return path.join(configDir(), "hub.json");
 }
 
 function pidPath() {
@@ -171,6 +171,7 @@ function serviceEnv(port, httpsPort) {
   if (publicUrl) env.MELDIVO_PUBLIC_URL = publicUrl;
   const host = resolveHost();
   if (host) env.MELDIVO_HOST = host;
+  if (readRuntime().hub) env.MELDIVO_HUB = "1";
   if (process.env.MELDIVO_MODELS_DIR) env.MELDIVO_MODELS_DIR = process.env.MELDIVO_MODELS_DIR;
   env.PATH = servicePath();
   return env;
@@ -312,19 +313,19 @@ function serviceMode() {
   return "detached";
 }
 
-async function cmdStart(args) {
+async function cmdStart(args, { quiet = false } = {}) {
   const foreground = args.includes("--foreground");
   const port = resolvePort();
   const httpsPort = resolveHttpsPort();
   const secret = ensureSecret();
-  writeRuntime({ port, httpsPort, publicUrl: resolvePublicUrl() || undefined, host: resolveHost() || undefined });
+  writeRuntime({ ...readRuntime(), port, httpsPort, publicUrl: resolvePublicUrl() || undefined, host: resolveHost() || undefined });
 
   if (foreground) {
     process.env.MELDIVO_SECRET = secret;
     process.env.MELDIVO_PORT = String(port);
     process.env.MELDIVO_HTTPS_PORT = String(httpsPort);
     const { startServer } = await import(pathToFileURL(serverEntry).href);
-    const server = await startServer({ port, host: "127.0.0.1", secret, httpsPort });
+    const server = await startServer({ port, host: "127.0.0.1", secret, httpsPort, hub: Boolean(readRuntime().hub), version: pkgJson.version });
     console.log(`meldivo running in the foreground on port ${server.port}`);
     await printUrl(secret);
     const shutdown = () => server.close().then(() => process.exit(0));
@@ -337,17 +338,19 @@ async function cmdStart(args) {
   const mode = serviceMode();
   if (mode === "systemd") {
     installSystemdUnit(env);
-    console.log("Installed and started the meldivo systemd user service.");
-    console.log("To keep it running after logout: loginctl enable-linger $USER");
+    if (!quiet) console.log("Installed and started the meldivo systemd user service.");
+    if (!quiet) console.log("To keep it running after logout: loginctl enable-linger $USER");
   } else if (mode === "launchd") {
     installLaunchAgent(env);
-    console.log("Installed and started the meldivo LaunchAgent.");
+    if (!quiet) console.log("Installed and started the meldivo LaunchAgent.");
   } else {
+    stopDetached();
     startDetached(env);
-    console.log(`Started meldivo as a background process (no user service manager found). Logs: ${logPath()}`);
+    if (!quiet) console.log(`Started meldivo as a background process (no user service manager found). Logs: ${logPath()}`);
   }
 
   await waitForHealth(port);
+  if (quiet) return;
   console.log("meldivo is up:");
   await printUrl(secret);
 }
@@ -379,6 +382,8 @@ async function cmdStatus() {
   try {
     const health = await waitForHealth(port, 2_000);
     console.log(`Health: ok, speech=${JSON.stringify(health.speech)}`);
+    if (health.hub) console.log("Hub: on (meldivo hub machines lists joined machines)");
+    if (health.joined) console.log(`Joined hub as "${health.joined.name}": ${health.joined.connected ? "connected" : "not connected"}`);
   } catch {
     console.log("Health: unreachable");
   }
@@ -388,57 +393,7 @@ async function cmdOpen(args) {
   const secret = ensureSecret();
   const url = hubUrl(secret);
   await printUrl(secret).then(() => {}).catch(() => {});
-  // Extra private addresses (MELDIVO_HOST) are what another hub uses with `meldivo peer add`.
-  for (const host of resolveHost().split(",").map((value) => value.trim()).filter((value) => value && value !== "127.0.0.1")) {
-    console.log(`Also on http://${host.includes(":") ? `[${host}]` : host}:${resolvePort()}/#token=${encodeURIComponent(secret)}`);
-  }
   if (args.includes("--browser")) openInBrowser(url);
-}
-
-function readPeers() {
-  try {
-    const peers = JSON.parse(readFileSync(peersPath(), "utf8"));
-    return Array.isArray(peers) ? peers : [];
-  } catch {
-    return [];
-  }
-}
-
-function writePeers(peers) {
-  ensureDir(configDir(), 0o700);
-  writePrivate(peersPath(), JSON.stringify(peers, null, 2));
-}
-
-// Peers are other machines' hubs shown in this one. The hub rereads the file, so no restart is needed.
-function cmdPeer(args) {
-  const [sub, name, link] = args;
-  if (!sub || sub === "list") {
-    const peers = readPeers();
-    if (peers.length === 0) console.log("No peers. Add one with: meldivo peer add <name> <link>");
-    for (const peer of peers) console.log(`${peer.name}\t${peer.url}`);
-    return;
-  }
-  if (sub === "remove" && name) {
-    const peers = readPeers();
-    const remaining = peers.filter((peer) => peer.name !== name);
-    if (remaining.length === peers.length) throw new Error(`No peer named "${name}"`);
-    writePeers(remaining);
-    console.log(`Removed ${name}.`);
-    return;
-  }
-  if (sub === "add" && name && link) {
-    if (!/^[A-Za-z0-9._-]{1,40}$/.test(name)) throw new Error("Peer names may use letters, digits, dot, dash, and underscore");
-    const parsed = new URL(link);
-    const token = decodeURIComponent(/(?:^#|&)token=([^&]+)/.exec(parsed.hash)?.[1] ?? "");
-    if (!token) throw new Error("The link must end in #token=<key> (run `meldivo open` on that machine)");
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("The link must be http(s)");
-    const peers = readPeers().filter((peer) => peer.name !== name);
-    peers.push({ name, url: parsed.origin, token });
-    writePeers(peers);
-    console.log(`Added ${name} (${parsed.origin}).`);
-    return;
-  }
-  throw new Error("Usage: meldivo peer [list] | add <name> <link> | remove <name>");
 }
 
 function openInBrowser(url) {
@@ -489,6 +444,90 @@ async function cmdRemote(args) {
   for (const alt of result.alternatives ?? []) console.log(`Also reachable at: ${alt}`);
 }
 
+// Addresses other machines can use to reach this hub: MELDIVO_HOST addresses, then the public URL.
+function hubAddresses() {
+  const port = resolvePort();
+  const addresses = resolveHost().split(",").map((value) => value.trim()).filter((value) => value && value !== "127.0.0.1")
+    .map((host) => `http://${host.includes(":") ? `[${host}]` : host}:${port}`);
+  if (resolvePublicUrl()) addresses.push(resolvePublicUrl());
+  return addresses.length ? addresses : [baseUrl()];
+}
+
+async function cmdHub(args) {
+  const [sub, name] = args;
+  const secret = ensureSecret();
+  if (sub === "enable" || sub === "disable") {
+    writeRuntime({ ...readRuntime(), hub: sub === "enable" || undefined });
+    await cmdStart([], { quiet: true });
+    if (sub === "disable") {
+      console.log("Hub mode is off. Machines that joined this hub keep trying to reconnect until you run `meldivo leave` on them.");
+      return;
+    }
+    console.log("This machine is now a hub. Open it with:");
+    await printUrl(secret);
+    console.log("To add a machine, run `meldivo hub code` here and follow the instructions it prints.");
+    return;
+  }
+  if (!readRuntime().hub) throw new Error("This machine is not a hub. Turn hub mode on with: meldivo hub enable");
+  if (sub === "code") {
+    const { code, expiresAt } = await apiCall("/api/hub/codes", "POST", secret);
+    const minutes = Math.round((expiresAt - Date.now()) / 60_000);
+    console.log(`One-time code (valid ${minutes} minutes, single use): ${code}`);
+    console.log("\nOn the machine you want to add, run:");
+    for (const address of hubAddresses()) console.log(`  meldivo join ${address} ${code}`);
+    console.log("\nUse an address that machine can reach privately, such as a VPN address (see MELDIVO_HOST).");
+    return;
+  }
+  if (!sub || sub === "machines") {
+    const { machines } = await apiCall("/api/hub/machines", "GET", secret);
+    if (machines.length === 0) console.log("No machines yet. Add one with: meldivo hub code");
+    for (const machine of machines) {
+      console.log(`${machine.name}\t${machine.online ? "online" : "offline"}${machine.version ? `\t${machine.version}` : ""}\tjoined ${new Date(machine.joinedAt).toISOString().slice(0, 10)}`);
+    }
+    return;
+  }
+  if (sub === "remove" && name) {
+    await apiCall(`/api/hub/machines/${encodeURIComponent(name)}`, "DELETE", secret);
+    console.log(`Removed ${name}. It can no longer connect; run \`meldivo leave\` on it to stop it trying.`);
+    return;
+  }
+  throw new Error("Usage: meldivo hub enable | disable | code | machines | remove <name>");
+}
+
+function optionValue(args, flag) {
+  const index = args.indexOf(flag);
+  return index >= 0 ? args[index + 1] : undefined;
+}
+
+async function cmdJoin(args) {
+  const positional = args.filter((arg, index) => !arg.startsWith("--") && !(index > 0 && args[index - 1].startsWith("--")));
+  const [hubAddress, code] = positional;
+  if (!hubAddress || !code) throw new Error("Usage: meldivo join <hub-address> <code> [--name <name>] [--allow pi,opencode,claude] [--speech]");
+  const requestedName = optionValue(args, "--name") ?? os.hostname().split(".")[0].replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 40);
+  const allow = optionValue(args, "--allow")?.split(",").map((id) => id.trim()).filter(Boolean);
+  const url = new URL(hubAddress);
+  if (url.protocol === "http:" && !/^(127\.|localhost$|\[::1\]$)/.test(url.hostname)) {
+    console.log("Note: this hub address is plain http. That is fine on a private VPN; over any other network use https.");
+  }
+  const { joinHub } = await import(pathToFileURL(path.join(pkgRoot, "dist", "server", "machine-client.js")).href);
+  const link = await joinHub(hubAddress, code, requestedName);
+  ensureDir(configDir(), 0o700);
+  const speech = args.includes("--speech") || undefined;
+  writePrivate(hubLinkPath(), JSON.stringify({ ...link, ...(allow?.length ? { allow } : {}), ...(speech ? { speech } : {}) }, null, 2));
+  await cmdStart([], { quiet: true });
+  console.log(`Joined the hub as "${link.name}". This machine's sessions now appear in the hub.`);
+}
+
+async function cmdLeave() {
+  if (!existsSync(hubLinkPath())) {
+    console.log("This machine has not joined a hub.");
+    return;
+  }
+  rmSync(hubLinkPath(), { force: true });
+  await cmdStart([], { quiet: true });
+  console.log("Left the hub. Also remove this machine on the hub with: meldivo hub remove <name>");
+}
+
 async function cmdUninstall(args) {
   await cmdStop();
   const mode = serviceMode();
@@ -524,14 +563,20 @@ function printHelp() {
 Usage: meldivo <command> [options]
 
 Commands:
-  start [--foreground]        Start the meldivo hub as a user service
+  start [--foreground]        Start meldivo as a user service
   stop                        Stop and disable the service
   status                      Show health, speech, and service state
   open [--browser]            Print the hub URL and QR (optionally open it)
   remote [tailscale|cloudflare|certificate|stop]
                                Manage remote access
-  peer [list|add <name> <link>|remove <name>]
-                              Show other machines' hubs in this one (link from their \`meldivo open\`)
+  hub enable|disable          Make this machine a hub that other machines join (or stop)
+  hub code                    Print a one-time code for adding a machine to this hub
+  hub machines                List the machines that joined this hub
+  hub remove <name>           Remove a machine from this hub
+  join <hub-address> <code> [--name <name>] [--allow pi,opencode,claude] [--speech]
+                              Join a hub: this machine's sessions appear there
+                              (--speech: also do speech for the hub)
+  leave                       Leave the hub this machine joined
   uninstall [--purge]         Stop and remove the service (optionally wipe config/cache/state)
   logs                        Tail service logs
   --version                   Print the version
@@ -558,8 +603,14 @@ async function main() {
       case "remote":
         await cmdRemote(rest);
         break;
-      case "peer":
-        cmdPeer(rest);
+      case "hub":
+        await cmdHub(rest);
+        break;
+      case "join":
+        await cmdJoin(rest);
+        break;
+      case "leave":
+        await cmdLeave();
         break;
       case "uninstall":
         await cmdUninstall(rest);

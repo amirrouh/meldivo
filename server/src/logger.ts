@@ -13,8 +13,11 @@ const knownApiPaths = new Set([
   "/api/voice/transcribe",
   "/api/voice/voices",
   "/api/voice/speech",
+  "/api/hub/join",
+  "/api/hub/codes",
+  "/api/hub/machines",
 ]);
-const forbiddenField = /(?:api.?key|auth(?:orization)?|password|token|secret|body|content|message|text|transcript|audio)/i;
+const forbiddenField = /(?:api.?key|auth(?:orization)?|password|token|secret|credential|code|body|content|message|text|transcript|audio|title)/i;
 
 export type Logger = {
   debug: (event: string, fields?: LogFields) => void;
@@ -106,6 +109,7 @@ function safeRequestPath(path: string): string {
   // Session keys are opaque ids; keep the route shape without them.
   const sessionRoute = path.match(/^\/api\/sessions\/[^/]+\/(chat|cancel)$/);
   if (sessionRoute) return `/api/sessions/:key/${sessionRoute[1]}`;
+  if (/^\/api\/hub\/machines\/[^/]+$/.test(path)) return "/api/hub/machines/:name";
   if (path.startsWith("/api/")) return "/api/unknown";
   return path === "/" ? "/" : "/web-asset";
 }

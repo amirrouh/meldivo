@@ -54,7 +54,7 @@ export function createAccessGate(secret: string): AccessGate {
 }
 
 // The same bare 404 for every unauthenticated request, page or API, right key path or not.
-function notFound(req: Request, res: Response): void {
+export function notFound(req: Request, res: Response): void {
   res.removeHeader("X-Request-Id");
   res.status(404).set({ "Cache-Control": "no-store", "Content-Type": "text/html" });
   res.end(req.method === "HEAD" ? undefined : NOT_FOUND_PAGE);

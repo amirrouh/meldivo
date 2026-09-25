@@ -1,6 +1,6 @@
 {
   "name": "meldivo",
-  "version": "1.1.1",
+  "version": "2.0.0",
   "description": "Always-on local voice hub for coding agents: talk hands-free to your Pi, OpenCode, and Claude Code sessions from any browser or phone. Private on-device speech (Parakeet + Kokoro). No cloud speech APIs.",
   "type": "module",
   "license": "MIT",
@@ -52,14 +52,16 @@
     "prebuild": "node web/scripts/copy-vad-assets.mjs",
     "build": "tsc -p server/tsconfig.json && tsc -p web/tsconfig.json && cd web && vite build",
     "test": "npm run build && node --import tsx --test tests/*.test.mjs",
-    "prepublishOnly": "npm test",
+    "prepublishOnly": "npm test && npm run privacy-check",
     "dev:server": "node --env-file-if-exists=.env --import tsx --watch server/src/index.ts",
-    "dev:web": "cd web && vite"
+    "dev:web": "cd web && vite",
+    "privacy-check": "node scripts/privacy-check.mjs"
   },
   "dependencies": {
     "express": "^5.0.1",
     "qrcode": "^1.5.4",
-    "sherpa-onnx-node": "^1.13.8"
+    "sherpa-onnx-node": "^1.13.8",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@ricky0123/vad-web": "0.0.30",
@@ -68,6 +70,7 @@
     "@types/qrcode": "^1.5.6",
     "@types/react": "^18.3.17",
     "@types/react-dom": "^18.3.5",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^4.3.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

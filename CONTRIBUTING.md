@@ -7,15 +7,22 @@ meldivo can read and drive your coding-agent sessions, so privacy comes before e
 - Never commit or publish secrets, tokens, real IP addresses, hostnames, domains, personal paths, emails,
   or real session content. Use placeholders such as `voice.example.com` and `<vpn-ip>`; test fixtures
   must be synthetic.
-- Review `git diff --cached` and `npm pack --dry-run` before every commit and release.
+- Review `git diff --cached` and `npm pack --dry-run` before every commit and release, and run
+  `npm run privacy-check` (it also runs in CI and before `npm publish`; `-- --staged` checks only
+  what you are about to commit).
 - Keep the access gate strict: nothing, including the page itself, is served without the secret, the server
   listens on `127.0.0.1` by default, and the secret must never be logged or cached by shared proxies.
-- Never add telemetry or any network call other than downloading the speech models.
+- Never add telemetry or any network call other than downloading the speech models and the hub
+  connection a user sets up with `meldivo join`.
+- Keep the hub protocol narrow (`server/src/protocol.ts`): a hub may only list a machine's sessions
+  and run or cancel text turns in them. Never add messages for commands, files, or configuration.
+- Test like a new user before a release: install the packed tarball (`npm pack`) as a throwaway
+  user with no existing `~/.config/meldivo`, and follow only the README and docs.
 
 ## Layout
 
 - `bin/meldivo.mjs` — the CLI entry point (`meldivo start|stop|status|open|
-  remote|logs|uninstall|--version`). Installs and manages the user service
+  remote|hub|join|leave|logs|uninstall|--version`). Installs and manages the user service
   (systemd `--user` on Linux, launchd on macOS) and talks to the running
   server over HTTP.
 - `server/src/index.ts` — the Express server: HTTP/HTTPS listeners, hub API,
@@ -25,6 +32,11 @@ meldivo can read and drive your coding-agent sessions, so privacy comes before e
 - `server/src/remote.ts` — phone/tablet access: Tailscale, Cloudflare quick
   tunnel, and own-certificate setup.
 - `server/src/qr.ts` — QR code rendering for hub and remote-access links.
+- `server/src/protocol.ts`, `server/src/hub.ts`, `server/src/machine-client.ts` —
+  hub mode: the wire protocol, the hub side (join codes, machine registry, turn
+  relay), and the machine side (outbound connection, hub identity check).
+- `scripts/privacy-check.mjs` — scans what would be committed or published for
+  personal data (IPs, emails, home paths, tokens).
 - `server/src/harnesses/` — one adapter per coding agent (`pi.ts`,
   `opencode.ts`, `claude.ts`), implementing the contract in
   `server/src/harnesses/types.ts`: session discovery and headless turn

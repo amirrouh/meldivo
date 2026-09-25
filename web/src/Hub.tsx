@@ -299,7 +299,10 @@ export default function Hub() {
 
   if (unauthorized) return <UnauthorizedScreen />;
 
-  const hosts: HostInfo[] = data?.hosts ?? (data ? [{ id: "", name: data.machine, online: true, harnesses: data.harnesses }] : []);
+  const allHosts: HostInfo[] = data?.hosts ?? (data ? [{ id: "", name: data.machine, online: true, harnesses: data.harnesses }] : []);
+  // A hub with no agents of its own (e.g. a small always-on box) only lists the machines that joined it.
+  const hosts = allHosts.filter((host) => host.id !== "" || allHosts.length === 1
+    || host.harnesses.some((harness) => harness.available) || (data?.sessions ?? []).some((session) => !session.host));
   const multiHost = hosts.length > 1;
   const speechStatusLabel = speechHealth.ready
     ? "Speech ready"
