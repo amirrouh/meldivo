@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { authHeaders, checkAuthorized, UnauthorizedError } from "./auth";
 import { UnauthorizedScreen } from "./UnauthorizedScreen";
-import { harnessLabel, harnessOrder, type HarnessDescriptor, type SessionInfo, type SessionsResponse } from "./session-types";
+import { harnessLabel, harnessOrder, type HarnessDescriptor, type HostInfo, type SessionInfo, type SessionsResponse } from "./session-types";
 
 const sessionsPollMs = 5_000;
 const healthPollMs = 5_000;
@@ -33,15 +33,15 @@ function openSession(key: string) {
   window.location.href = `/?session=${encodeURIComponent(key)}`;
 }
 
-function harnessTile(harness: HarnessDescriptor) {
-  const description = harness.id === "pi" ? "New chat in your home folder" : "New chat in your home folder";
+function harnessTile(harness: HarnessDescriptor, prefix: string) {
+  const description = "New chat in your home folder";
   return (
     <button
       key={harness.id}
       type="button"
       className="hub-tile"
       disabled={!harness.available}
-      onClick={() => openSession(`new:${harness.id}`)}
+      onClick={() => openSession(`${prefix}new:${harness.id}`)}
     >
       <span className="hub-tile__label">{harness.label}</span>
       <span className="hub-tile__desc">{harness.available ? description : "not installed"}</span>
@@ -164,6 +164,73 @@ function RemotePanel({ onClose }: { onClose: () => void }) {
   );
 }
 
+function HostSection({ host, sessions, multiHost }: { host: HostInfo; sessions: SessionInfo[]; multiHost: boolean }) {
+  const prefix = host.id ? `@${host.id}/` : "";
+  const harnesses = [...host.harnesses].sort((a, b) => harnessOrder.indexOf(a.id) - harnessOrder.indexOf(b.id));
+  const groups = new Map<string, SessionInfo[]>();
+  for (const session of sessions) {
+    const list = groups.get(session.cwd) ?? [];
+    list.push(session);
+    groups.set(session.cwd, list);
+  }
+  const groupEntries = [...groups.entries()].sort(
+    (a, b) => Math.max(...b[1].map((s) => s.updatedAt)) - Math.max(...a[1].map((s) => s.updatedAt)),
+  );
+
+  return (
+    <div className={multiHost ? "hub-host" : undefined}>
+      {multiHost && (
+        <h2 className="hub-host__title">
+          <span className={host.online ? "hub-dot hub-dot--open" : "hub-dot hub-dot--idle"} aria-hidden="true" />
+          {host.name}
+          {!host.online && <span className="hub-muted"> offline</span>}
+        </h2>
+      )}
+      {host.online && (
+        <>
+          <section className="hub-section">
+            <h2>Start a conversation</h2>
+            <div className="hub-tiles">
+              {harnesses.map((harness) => harnessTile(harness, prefix))}
+              {harnesses.length === 0 && <p className="hub-muted">No harnesses detected on this machine.</p>}
+            </div>
+          </section>
+
+          <section className="hub-section">
+            <h2>Sessions</h2>
+            {sessions.length === 0 && <p className="hub-muted">No sessions yet. Tap a tile above to start one.</p>}
+            {groupEntries.map(([cwd, group]) => (
+              <div key={cwd} className="hub-group">
+                <h3 className="hub-group__title">{shortenCwd(cwd)}</h3>
+                <ul className="hub-sessions">
+                  {group.sort((a, b) => b.updatedAt - a.updatedAt).map((session) => {
+                    const dot = stateDot(session);
+                    return (
+                      <li key={session.key}>
+                        <button type="button" className="hub-session" onClick={() => openSession(session.key)}>
+                          <span className={dot.className} aria-hidden="true" title={dot.label} />
+                          <span className="hub-session__body">
+                            <span className="hub-session__title">{session.title}</span>
+                            <span className="hub-session__meta">
+                              <span className="hub-session__badge">{harnessLabel[session.harness]}</span>
+                              <span>{relativeTime(session.updatedAt)}</span>
+                            </span>
+                            {session.open && <span className="hub-session__hint">continues as a voice copy</span>}
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            ))}
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function Hub() {
   const [data, setData] = useState<SessionsResponse | null>(null);
   const [error, setError] = useState("");
@@ -232,19 +299,8 @@ export default function Hub() {
 
   if (unauthorized) return <UnauthorizedScreen />;
 
-  const harnesses = [...(data?.harnesses ?? [])].sort(
-    (a, b) => harnessOrder.indexOf(a.id) - harnessOrder.indexOf(b.id),
-  );
-  const sessions = data?.sessions ?? [];
-  const groups = new Map<string, SessionInfo[]>();
-  for (const session of sessions) {
-    const list = groups.get(session.cwd) ?? [];
-    list.push(session);
-    groups.set(session.cwd, list);
-  }
-  const groupEntries = [...groups.entries()].sort(
-    (a, b) => Math.max(...b[1].map((s) => s.updatedAt)) - Math.max(...a[1].map((s) => s.updatedAt)),
-  );
+  const hosts: HostInfo[] = data?.hosts ?? (data ? [{ id: "", name: data.machine, online: true, harnesses: data.harnesses }] : []);
+  const multiHost = hosts.length > 1;
   const speechStatusLabel = speechHealth.ready
     ? "Speech ready"
     : speechHealth.downloading
@@ -254,7 +310,7 @@ export default function Hub() {
   return (
     <main className="hub-page">
       <header className="hub-header">
-        <h1>{data?.machine ?? "Meldivo"}</h1>
+        <h1>{multiHost ? "Meldivo" : data?.machine ?? "Meldivo"}</h1>
         <p className={`hub-speech-status${speechHealth.ready ? "" : " hub-speech-status--warn"}`} role="status">
           {speechHealth.error || speechStatusLabel}
         </p>
@@ -263,43 +319,14 @@ export default function Hub() {
 
       {error && <p className="hub-error" role="alert">{error}</p>}
 
-      <section className="hub-section">
-        <h2>Start a conversation</h2>
-        <div className="hub-tiles">
-          {harnesses.map(harnessTile)}
-          {harnesses.length === 0 && <p className="hub-muted">No harnesses detected on this machine.</p>}
-        </div>
-      </section>
-
-      <section className="hub-section">
-        <h2>Sessions</h2>
-        {sessions.length === 0 && <p className="hub-muted">No sessions yet. Tap a tile above to start one.</p>}
-        {groupEntries.map(([cwd, group]) => (
-          <div key={cwd} className="hub-group">
-            <h3 className="hub-group__title">{shortenCwd(cwd)}</h3>
-            <ul className="hub-sessions">
-              {group.sort((a, b) => b.updatedAt - a.updatedAt).map((session) => {
-                const dot = stateDot(session);
-                return (
-                  <li key={session.key}>
-                    <button type="button" className="hub-session" onClick={() => openSession(session.key)}>
-                      <span className={dot.className} aria-hidden="true" title={dot.label} />
-                      <span className="hub-session__body">
-                        <span className="hub-session__title">{session.title}</span>
-                        <span className="hub-session__meta">
-                          <span className="hub-session__badge">{harnessLabel[session.harness]}</span>
-                          <span>{relativeTime(session.updatedAt)}</span>
-                        </span>
-                        {session.open && <span className="hub-session__hint">continues as a voice copy</span>}
-                      </span>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-        ))}
-      </section>
+      {hosts.map((host) => (
+        <HostSection
+          key={host.id || "local"}
+          host={host}
+          multiHost={multiHost}
+          sessions={(data?.sessions ?? []).filter((session) => (session.host ?? "") === host.id)}
+        />
+      ))}
 
       {remoteOpen && <RemotePanel onClose={() => setRemoteOpen(false)} />}
     </main>

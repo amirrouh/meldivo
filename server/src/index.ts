@@ -11,6 +11,7 @@ import { createAdapters, listAllSessions } from "./harnesses/index.js";
 import type { HarnessAdapter, HarnessId, SendTarget, SessionInfo, TurnEvent } from "./harnesses/types.js";
 import { createAccessGate } from "./access.js";
 import { createLogger, requestLoggingMiddleware } from "./logger.js";
+import { fetchPeerSnapshot, loadPeers, parsePeerKey, peerCancel, peerChat, type Peer, type PeerSnapshot } from "./peers.js";
 import { detectRemoteOptions, RemoteManager, remoteGuideUrl, type RemoteId } from "./remote.js";
 import { createSherpaEngine, type SpeechEngine } from "./speech.js";
 import { defaultStateDir, SessionStateStore } from "./state.js";
@@ -32,6 +33,8 @@ export interface StartServerOptions {
   webDir?: string;
   stateDir?: string;
   httpsPort?: number;
+  /** Other machines' hubs to show and drive from this one (default: ~/.config/meldivo/peers.json). */
+  peers?: () => Peer[];
 }
 
 // Where a user-supplied TLS certificate for remote access lives.
@@ -70,6 +73,7 @@ type SessionsSnapshot = {
   at: number;
   harnesses: { id: HarnessId; label: string; available: boolean }[];
   sessions: SessionInfo[];
+  peers: PeerSnapshot[];
 };
 
 type AttemptOutcome = "committed" | "failed";
@@ -88,6 +92,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       adapter.warmup?.().catch((error: unknown) => console.error(`${adapter.id} warmup failed:`, error));
     }
   }
+  const listPeers = options.peers ?? (() => loadPeers());
   const adapterById = new Map(adapters.map((adapter) => [adapter.id, adapter]));
   const stateStore = new SessionStateStore(stateDir);
   const voiceLease = new VoiceLease(VOICE_LEASE_TTL_MS);
@@ -149,21 +154,33 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
 
   async function getSessionsSnapshot(): Promise<SessionsSnapshot> {
     if (sessionsSnapshot && Date.now() - sessionsSnapshot.at < SESSIONS_CACHE_MS) return sessionsSnapshot;
-    const [sessions, availability, forkIds] = await Promise.all([
+    const [sessions, availability, forkIds, peers] = await Promise.all([
       listAllSessions(adapters, SESSIONS_LIMIT),
       Promise.all(adapters.map(async (adapter) => ({ id: adapter.id, label: adapter.label, available: await adapter.available() }))),
       stateStore.allForkIds(),
+      Promise.all(listPeers().map(fetchPeerSnapshot)),
     ]);
     // Voice forks are an implementation detail of continuing an open session;
     // hide them from the list so they don't show up as extra sessions.
     const visible = sessions.filter((session) => !forkIds.has(session.id));
-    sessionsSnapshot = { at: Date.now(), harnesses: availability, sessions: visible };
+    sessionsSnapshot = { at: Date.now(), harnesses: availability, sessions: visible, peers };
     return sessionsSnapshot;
   }
 
   app.get("/api/sessions", async (_req, res) => {
     const snapshot = await getSessionsSnapshot();
-    res.set("Cache-Control", "no-store").json({ machine: hostname(), harnesses: snapshot.harnesses, sessions: snapshot.sessions });
+    const machine = hostname();
+    // `machine`/`harnesses` describe this hub; `hosts` adds every peer, and peer sessions
+    // carry `host` plus a key prefixed with `@<host>/`.
+    res.set("Cache-Control", "no-store").json({
+      machine,
+      harnesses: snapshot.harnesses,
+      sessions: [...snapshot.sessions, ...snapshot.peers.flatMap((peer) => peer.sessions)],
+      hosts: [
+        { id: "", name: machine, online: true, harnesses: snapshot.harnesses },
+        ...snapshot.peers.map((peer) => ({ id: peer.name, name: peer.name, machine: peer.machine, online: peer.online, harnesses: peer.harnesses })),
+      ],
+    });
   });
 
   // Runs one candidate adapter for one turn, streaming its events to `res`.
@@ -347,6 +364,36 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     }
   }
 
+  // Relays one turn to a peer hub and streams its events back unchanged.
+  async function runPeer(name: string, key: string, message: string, conversationId: string | undefined, signal: AbortSignal, res: express.Response): Promise<void> {
+    const peer = listPeers().find((candidate) => candidate.name === name);
+    if (!peer) {
+      sendEvent(res, { type: "error", message: `Unknown machine "${name}"` });
+      res.end();
+      return;
+    }
+    let upstream: Response;
+    try {
+      upstream = await peerChat(peer, key, { message, conversationId }, signal);
+    } catch {
+      if (!signal.aborted) sendEvent(res, { type: "error", message: `${name} is unreachable` });
+      res.end();
+      return;
+    }
+    if (!upstream.ok || !upstream.body) {
+      const body = await upstream.json().catch(() => ({})) as { error?: unknown };
+      sendEvent(res, { type: "error", message: typeof body.error === "string" ? body.error : `${name} returned ${upstream.status}` });
+      res.end();
+      return;
+    }
+    try {
+      for await (const chunk of upstream.body) res.write(chunk);
+    } catch {
+      if (!signal.aborted) sendEvent(res, { type: "error", message: `Lost the connection to ${name}` });
+    }
+    if (!res.writableEnded) res.end();
+  }
+
   app.post("/api/sessions/:key/chat", async (req, res) => {
     const key = req.params.key!;
     const message = readMessage(req.body?.message);
@@ -381,7 +428,10 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     };
 
     try {
-      if (key === "quick") {
+      const peerTarget = parsePeerKey(key);
+      if (peerTarget) {
+        await runPeer(peerTarget.name, peerTarget.inner, message, conversationId, controller.signal, res);
+      } else if (key === "quick") {
         await runQuick(message, conversationId, controller.signal, res);
       } else if (key.startsWith("new:")) {
         await runNew(key.slice(4) as HarnessId, message, conversationId, controller.signal, res, registerAlias);
@@ -400,12 +450,22 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     }
   });
 
-  app.post("/api/sessions/:key/cancel", (req, res) => {
+  app.post("/api/sessions/:key/cancel", async (req, res) => {
     const key = req.params.key!;
     const controller = activeTurns.get(key);
-    if (!controller) return res.status(404).json({ error: "No active turn for this session" });
-    controller.abort();
-    res.status(204).end();
+    if (controller) {
+      // For a peer turn, closing the relayed request cancels it on the peer too.
+      controller.abort();
+      return res.status(204).end();
+    }
+    const peerTarget = parsePeerKey(key);
+    const peer = peerTarget && listPeers().find((candidate) => candidate.name === peerTarget.name);
+    if (peerTarget && peer) {
+      // A resolved key the peer registered mid-turn (see registerAlias) is only known there.
+      const upstream = await peerCancel(peer, peerTarget.inner).catch(() => undefined);
+      return res.status(upstream?.status === 204 ? 204 : 404).end();
+    }
+    res.status(404).json({ error: "No active turn for this session" });
   });
 
   app.get("/api/remote", (_req, res) => {

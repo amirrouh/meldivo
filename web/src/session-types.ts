@@ -14,6 +14,8 @@ export interface SessionInfo {
   open: boolean;
   busy?: boolean;
   model?: string;
+  /** Set for sessions on another machine: that machine's name in this hub. */
+  host?: string;
 }
 
 export interface HarnessDescriptor {
@@ -22,10 +24,25 @@ export interface HarnessDescriptor {
   available: boolean;
 }
 
+export interface HostInfo {
+  /** "" for this machine, otherwise the peer's name (its sessions' keys start with `@<id>/`). */
+  id: string;
+  name: string;
+  online: boolean;
+  harnesses: HarnessDescriptor[];
+}
+
 export interface SessionsResponse {
   machine: string;
   harnesses: HarnessDescriptor[];
   sessions: SessionInfo[];
+  hosts?: HostInfo[];
+}
+
+/** Splits `@<host>/<key>` into the host prefix (`@<host>/`, or "" for this machine) and the key. */
+export function splitHostKey(key: string): { prefix: string; host: string; inner: string } {
+  const match = /^@([A-Za-z0-9._-]{1,40})\/(.+)$/.exec(key);
+  return match ? { prefix: `@${match[1]}/`, host: match[1]!, inner: match[2]! } : { prefix: "", host: "", inner: key };
 }
 
 export type TurnEvent =

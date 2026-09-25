@@ -7,6 +7,9 @@ import path from "node:path";
 import test from "node:test";
 import { startServer } from "../server/src/index.ts";
 
+// Keep the hubs under test away from the real ~/.config/meldivo (peers.json in particular).
+process.env.XDG_CONFIG_HOME = mkdtempSync(path.join(tmpdir(), "meldivo-config-"));
+
 function fakeSpeechEngine() {
   return {
     async transcribe(wav, _signal) {
@@ -462,6 +465,89 @@ test("Meldivo hub: cancel finds a new:<harness> turn by its resolved <harness>:<
     headers: { authorization: `Bearer ${secret}` },
   });
   assert.equal(again.status, 404);
+});
+
+test("Meldivo hub: peers' sessions are listed and driven through this hub", async (t) => {
+  const peerSecret = "p".repeat(32);
+  const secret = "s".repeat(32);
+  const claude = fakeAdapter("claude", "Claude Code", {
+    sessions: [{ key: "claude:abc", harness: "claude", id: "abc", title: "Remote work", cwd: "/work", updatedAt: 5, open: false }],
+  });
+  const pi = fakeAdapter("pi", "Pi");
+  const peerServer = await startServer({
+    port: 0,
+    secret: peerSecret,
+    speech: fakeSpeechEngine(),
+    webDir: "/does/not/exist",
+    adapters: [pi, fakeAdapter("opencode", "OpenCode", { available: false }), claude],
+    stateDir: tmpStateDir(),
+  });
+  t.after(() => peerServer.close());
+  const peers = [
+    { name: "box", url: `http://127.0.0.1:${peerServer.port}`, token: peerSecret },
+    { name: "gone", url: "http://127.0.0.1:1", token: "x".repeat(32) },
+  ];
+  const server = await startServer({
+    port: 0,
+    secret,
+    speech: fakeSpeechEngine(),
+    webDir: "/does/not/exist",
+    adapters: [fakeAdapter("pi", "Pi"), fakeAdapter("opencode", "OpenCode"), fakeAdapter("claude", "Claude Code")],
+    stateDir: tmpStateDir(),
+    peers: () => peers,
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.port}`;
+  const auth = { "content-type": "application/json", "x-meldivo-token": secret };
+
+  await t.test("lists every machine and the peer's sessions under @<name>/ keys", async () => {
+    const body = await (await fetch(`${base}/api/sessions`, { headers: auth })).json();
+    assert.deepEqual(body.hosts.map((host) => [host.id, host.online]), [["", true], ["box", true], ["gone", false]]);
+    assert.deepEqual(body.hosts[1].harnesses.map((h) => [h.id, h.available]), [["pi", true], ["opencode", false], ["claude", true]]);
+    assert.equal(body.sessions.length, 1);
+    assert.equal(body.sessions[0].key, "@box/claude:abc");
+    assert.equal(body.sessions[0].host, "box");
+    assert.doesNotMatch(JSON.stringify(body), new RegExp(peerSecret));
+  });
+
+  await t.test("relays a turn to the peer and streams its events back", async () => {
+    claude.queueSend(() => okTurn("abc", ["Hello ", "there."]));
+    const response = await fetch(`${base}/api/sessions/${encodeURIComponent("@box/claude:abc")}/chat`, {
+      method: "POST", headers: auth, body: JSON.stringify({ message: "hi", conversationId: "c1" }),
+    });
+    const events = await readSseUntilDone(response);
+    assert.deepEqual(events.filter((e) => e.type === "delta").map((e) => e.text), ["Hello ", "there."]);
+    assert.equal(events.at(-1).type, "done");
+    assert.equal(claude.calls.at(-1).text, "hi");
+  });
+
+  await t.test("cancel reaches a peer's new chat by its resolved key", async () => {
+    pi.queueSend(async function* (_target, _text, signal) {
+      yield { type: "session", id: "p1" };
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, 5_000);
+        signal.addEventListener("abort", () => { clearTimeout(timer); reject(new DOMException("aborted", "AbortError")); });
+      });
+      yield { type: "done" };
+    });
+    const chat = fetch(`${base}/api/sessions/${encodeURIComponent("@box/new:pi")}/chat`, {
+      method: "POST", headers: auth, body: JSON.stringify({ message: "hi", conversationId: "c2" }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const cancel = await fetch(`${base}/api/sessions/${encodeURIComponent("@box/pi:p1")}/cancel`, { method: "POST", headers: auth });
+    assert.equal(cancel.status, 204);
+    await readSseUntilDone(await chat);
+  });
+
+  await t.test("an unreachable or unknown machine is reported as an error event", async () => {
+    for (const key of ["@gone/new:pi", "@nobody/new:pi"]) {
+      const response = await fetch(`${base}/api/sessions/${encodeURIComponent(key)}/chat`, {
+        method: "POST", headers: auth, body: JSON.stringify({ message: "hi" }),
+      });
+      const events = await readSseUntilDone(response);
+      assert.equal(events.at(-1).type, "error");
+    }
+  });
 });
 
 test("Meldivo hub: voice endpoints", async (t) => {

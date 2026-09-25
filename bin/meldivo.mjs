@@ -42,6 +42,10 @@ function runtimePath() {
   return path.join(configDir(), "runtime.json");
 }
 
+function peersPath() {
+  return path.join(configDir(), "peers.json");
+}
+
 function pidPath() {
   return path.join(stateDir(), "meldivo.pid");
 }
@@ -383,9 +387,58 @@ async function cmdStatus() {
 async function cmdOpen(args) {
   const secret = ensureSecret();
   const url = hubUrl(secret);
-  console.log(url);
   await printUrl(secret).then(() => {}).catch(() => {});
+  // Extra private addresses (MELDIVO_HOST) are what another hub uses with `meldivo peer add`.
+  for (const host of resolveHost().split(",").map((value) => value.trim()).filter((value) => value && value !== "127.0.0.1")) {
+    console.log(`Also on http://${host.includes(":") ? `[${host}]` : host}:${resolvePort()}/#token=${encodeURIComponent(secret)}`);
+  }
   if (args.includes("--browser")) openInBrowser(url);
+}
+
+function readPeers() {
+  try {
+    const peers = JSON.parse(readFileSync(peersPath(), "utf8"));
+    return Array.isArray(peers) ? peers : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePeers(peers) {
+  ensureDir(configDir(), 0o700);
+  writePrivate(peersPath(), JSON.stringify(peers, null, 2));
+}
+
+// Peers are other machines' hubs shown in this one. The hub rereads the file, so no restart is needed.
+function cmdPeer(args) {
+  const [sub, name, link] = args;
+  if (!sub || sub === "list") {
+    const peers = readPeers();
+    if (peers.length === 0) console.log("No peers. Add one with: meldivo peer add <name> <link>");
+    for (const peer of peers) console.log(`${peer.name}\t${peer.url}`);
+    return;
+  }
+  if (sub === "remove" && name) {
+    const peers = readPeers();
+    const remaining = peers.filter((peer) => peer.name !== name);
+    if (remaining.length === peers.length) throw new Error(`No peer named "${name}"`);
+    writePeers(remaining);
+    console.log(`Removed ${name}.`);
+    return;
+  }
+  if (sub === "add" && name && link) {
+    if (!/^[A-Za-z0-9._-]{1,40}$/.test(name)) throw new Error("Peer names may use letters, digits, dot, dash, and underscore");
+    const parsed = new URL(link);
+    const token = decodeURIComponent(/(?:^#|&)token=([^&]+)/.exec(parsed.hash)?.[1] ?? "");
+    if (!token) throw new Error("The link must end in #token=<key> (run `meldivo open` on that machine)");
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("The link must be http(s)");
+    const peers = readPeers().filter((peer) => peer.name !== name);
+    peers.push({ name, url: parsed.origin, token });
+    writePeers(peers);
+    console.log(`Added ${name} (${parsed.origin}).`);
+    return;
+  }
+  throw new Error("Usage: meldivo peer [list] | add <name> <link> | remove <name>");
 }
 
 function openInBrowser(url) {
@@ -477,6 +530,8 @@ Commands:
   open [--browser]            Print the hub URL and QR (optionally open it)
   remote [tailscale|cloudflare|certificate|stop]
                                Manage remote access
+  peer [list|add <name> <link>|remove <name>]
+                              Show other machines' hubs in this one (link from their \`meldivo open\`)
   uninstall [--purge]         Stop and remove the service (optionally wipe config/cache/state)
   logs                        Tail service logs
   --version                   Print the version
@@ -502,6 +557,9 @@ async function main() {
         break;
       case "remote":
         await cmdRemote(rest);
+        break;
+      case "peer":
+        cmdPeer(rest);
         break;
       case "uninstall":
         await cmdUninstall(rest);

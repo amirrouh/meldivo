@@ -77,6 +77,7 @@ project.
 | `meldivo remote cloudflare` | Publish the hub through a Cloudflare quick tunnel. |
 | `meldivo remote certificate` | Publish the hub over HTTPS using your own certificate. |
 | `meldivo remote stop` | Turn remote access off. |
+| `meldivo peer add <name> <link>` | Show another machine's hub (and its sessions) in this one. `meldivo peer` lists peers; `meldivo peer remove <name>` removes one. |
 | `meldivo logs` | Show the service's recent log output. |
 | `meldivo uninstall [--purge]` | Remove the background service. `--purge` also deletes configuration, models, and logs. |
 | `meldivo --version` | Print the installed version. |
@@ -97,6 +98,31 @@ Whichever option you pick, the link is the same hub link — the whole hub
 becomes reachable from that device, protected by its token. See the
 [remote access guide](docs/remote-access.md) for setup details, including
 how to trust a certificate on iPhone and Android.
+
+## Several machines, one hub
+
+Install meldivo on each machine, pick one as the main hub, and add the others
+to it as peers. The main hub then lists every machine with its own new-chat
+tiles and sessions, all behind the main hub's single link. Speech runs on the
+main hub; only the text of each turn travels to the other machine.
+
+Peers must be reachable from the main hub over a private network such as a
+VPN. On each other machine:
+
+```sh
+MELDIVO_HOST=<vpn-ip> meldivo start   # also listen on the VPN address
+meldivo open                          # prints "Also on http://<vpn-ip>:4100/#token=..."
+```
+
+Then on the main hub:
+
+```sh
+meldivo peer add workstation 'http://<vpn-ip>:4100/#token=...'
+```
+
+Peer links are stored in `~/.config/meldivo/peers.json`, readable only by you.
+Never put a peer on a public address: the main hub's link now controls every
+machine it lists.
 
 ## How it works
 
@@ -126,6 +152,7 @@ All settings are optional.
 | Path | Contents |
 |---|---|
 | `~/.config/meldivo/secret` | The hub's shared secret, generated automatically. |
+| `~/.config/meldivo/peers.json` | Other machines' hubs shown in this one, with their keys. |
 | `~/.cache/meldivo/models` | Downloaded speech models. |
 | `~/.local/state/meldivo` | Service logs and runtime state. |
 
@@ -134,7 +161,8 @@ All settings are optional.
 The server listens on `127.0.0.1` only; it is never exposed on the network
 unless you explicitly turn on phone access. Every hub link, local or remote,
 embeds a random token, and requests without it are rejected. Treat the hub
-link like a password: anyone who has it can use every session in the hub.
+link like a password: anyone who has it can use every session in the hub,
+including the sessions of every peer machine added to it.
 
 ## Uninstall
 

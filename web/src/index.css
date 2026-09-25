@@ -83,6 +83,10 @@ button { font: inherit; }
 .hub-remote-button { margin-left: auto; padding: 8px 13px; border: 1px solid rgb(255 255 255 / .16); border-radius: 999px; color: inherit; background: rgb(255 255 255 / .07); cursor: pointer; font-size: 12px; }
 .hub-remote-button:hover, .hub-remote-button:focus-visible { background: rgb(255 255 255 / .14); outline: none; }
 .hub-section { margin-bottom: 30px; }
+.hub-host { margin-bottom: 34px; padding-top: 18px; border-top: 1px solid rgb(255 255 255 / .1); }
+.hub-host:first-of-type { padding-top: 0; border-top: 0; }
+.hub-host__title { display: flex; align-items: center; gap: 9px; margin: 0 0 16px; font-size: 16px; font-weight: 620; }
+.hub-host__title .hub-dot { margin-top: 0; }
 .hub-section h2 { margin: 0 0 12px; color: rgb(208 214 228 / .7); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }
 .hub-muted { margin: 0; color: rgb(208 214 228 / .55); font-size: 13px; }
 .hub-error { margin: 0 0 16px; padding: 9px 12px; border: 1px solid rgb(255 178 183 / .3); border-radius: 10px; background: rgb(39 16 22 / .7); color: rgb(255 203 208); font-size: 12px; }

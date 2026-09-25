@@ -25,20 +25,22 @@ import { clearVoicePreference, readVoicePreference, writeVoicePreference } from 
 import { uid } from "./uid";
 import { authHeaders, checkAuthorized, UnauthorizedError } from "./auth";
 import { UnauthorizedScreen } from "./UnauthorizedScreen";
-import { harnessLabel, type HarnessId, type SessionsResponse, type TurnEvent } from "./session-types";
+import { harnessLabel, splitHostKey, type HarnessId, type SessionsResponse, type TurnEvent } from "./session-types";
 
 interface AppProps {
   sessionKey: string;
 }
 
-type SessionDisplay = { harness?: HarnessId; title: string; cwd: string };
+type SessionDisplay = { harness?: HarnessId; title: string; cwd: string; host?: string };
 
-function deriveSessionDisplay(key: string): SessionDisplay {
-  if (key.startsWith("new:")) return { harness: key.slice(4) as HarnessId, title: "New chat", cwd: "~" };
-  if (key === "quick") return { title: "Quick chat", cwd: "~" };
+function deriveSessionDisplay(fullKey: string): SessionDisplay {
+  const { host: hostName, inner: key } = splitHostKey(fullKey);
+  const host = hostName || undefined;
+  if (key.startsWith("new:")) return { harness: key.slice(4) as HarnessId, title: "New chat", cwd: "~", host };
+  if (key === "quick") return { title: "Quick chat", cwd: "~", host };
   const separator = key.indexOf(":");
-  if (separator === -1) return { title: key, cwd: "" };
-  return { harness: key.slice(0, separator) as HarnessId, title: key.slice(separator + 1), cwd: "" };
+  if (separator === -1) return { title: key, cwd: "", host };
+  return { harness: key.slice(0, separator) as HarnessId, title: key.slice(separator + 1), cwd: "", host };
 }
 
 function conversationStorageKey(sessionKey: string): string {
@@ -599,8 +601,9 @@ export default function App({ sessionKey }: AppProps) {
 
   const applySessionEvent = (id: string) => {
     const knownHarness = harnessRef.current;
+    const { prefix } = splitHostKey(liveKey.current);
     if (knownHarness) {
-      liveKey.current = `${knownHarness}:${id}`;
+      liveKey.current = `${prefix}${knownHarness}:${id}`;
       return;
     }
     void fetch("/api/sessions", { headers: authHeaders() })
@@ -608,11 +611,11 @@ export default function App({ sessionKey }: AppProps) {
       .then(async (response) => {
         if (!response.ok) return;
         const result = await response.json() as SessionsResponse;
-        const match = result.sessions.find((session) => session.id === id);
+        const match = result.sessions.find((session) => session.id === id && splitHostKey(session.key).prefix === prefix);
         if (!match) return;
         liveKey.current = match.key;
         harnessRef.current = match.harness;
-        if (mounted.current) setSessionDisplay({ harness: match.harness, title: match.title, cwd: match.cwd });
+        if (mounted.current) setSessionDisplay({ harness: match.harness, title: match.title, cwd: match.cwd, host: match.host });
       })
       .catch(() => undefined);
   };
@@ -1065,7 +1068,7 @@ export default function App({ sessionKey }: AppProps) {
         const match = result.sessions.find((session) => session.key === sessionKey);
         if (match && !controller.signal.aborted) {
           harnessRef.current = match.harness;
-          setSessionDisplay({ harness: match.harness, title: match.title, cwd: match.cwd });
+          setSessionDisplay({ harness: match.harness, title: match.title, cwd: match.cwd, host: match.host });
         }
       })
       .catch((caught) => {
@@ -1188,7 +1191,9 @@ export default function App({ sessionKey }: AppProps) {
       <span className="room-header__title">
         {sessionDisplay.harness ? harnessLabel[sessionDisplay.harness] : "Meldivo"} · {sessionDisplay.title}
       </span>
-      {sessionDisplay.cwd && <span className="room-header__cwd">{sessionDisplay.cwd}</span>}
+      {(sessionDisplay.host || sessionDisplay.cwd) && <span className="room-header__cwd">
+        {[sessionDisplay.host, sessionDisplay.cwd].filter(Boolean).join(" · ")}
+      </span>}
     </header>
     {statusText && <p className="room-status" role="status">{statusText}</p>}
     {usingFallbackVad && <p className="room-status voice-fallback-notice" role="status">Using basic voice detection</p>}
