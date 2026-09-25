@@ -80,6 +80,12 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   const stateDir = options.stateDir ?? defaultStateDir();
   const logger = createLogger();
   const adapters = options.adapters ?? createAdapters();
+  if (!options.adapters) {
+    // Start slow-to-boot harness backends (the OpenCode server) now rather than on the first turn.
+    for (const adapter of adapters) {
+      adapter.warmup?.().catch((error: unknown) => console.error(`${adapter.id} warmup failed:`, error));
+    }
+  }
   const adapterById = new Map(adapters.map((adapter) => [adapter.id, adapter]));
   const stateStore = new SessionStateStore(stateDir);
   const voiceLease = new VoiceLease(VOICE_LEASE_TTL_MS);

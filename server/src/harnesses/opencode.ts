@@ -271,6 +271,10 @@ export function createOpenCodeAdapter(options: OpenCodeOptions = {}): HarnessAda
       return value;
     },
 
+    async warmup(): Promise<void> {
+      if (await this.available()) await warmServer.ensure();
+    },
+
     async listSessions(limit?: number): Promise<SessionInfo[]> {
       const db = openDb();
       if (!db) return [];

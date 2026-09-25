@@ -1,6 +1,6 @@
 {
   "name": "meldivo",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Always-on local voice hub for coding agents: talk hands-free to your Pi, OpenCode, and Claude Code sessions from any browser or phone. Private on-device speech (Parakeet + Kokoro). No cloud speech APIs.",
   "type": "module",
   "license": "MIT",

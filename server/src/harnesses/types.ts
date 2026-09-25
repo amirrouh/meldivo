@@ -42,6 +42,8 @@ export interface HarnessAdapter {
   label: string;
   /** Whether the harness CLI is installed and runnable. */
   available(): Promise<boolean>;
+  /** Optional: prepare in the background (e.g. start a server) so the first turn is fast. */
+  warmup?(): Promise<void>;
   /** Top-level sessions, most recently updated first. */
   listSessions(limit?: number): Promise<SessionInfo[]>;
   /** Run one user turn headlessly with the harness's own model and credentials. */

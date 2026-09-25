@@ -335,6 +335,8 @@ export function createSherpaEngine(options?: { modelsDir?: string }): SpeechEngi
         });
 
         state.ready = true;
+        // Remove the int8 Kokoro build that versions before 1.0.3 downloaded (slower on x86 CPUs).
+        void rm(path.join(modelsDir, "kokoro-int8-multi-lang-v1_0"), { recursive: true, force: true }).catch(() => undefined);
 
         // Warm up: the first real synthesize/transcribe call after load()
         // should not pay any one-time initialization cost (e.g. onnxruntime
