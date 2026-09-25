@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { authHeaders, checkAuthorized, UnauthorizedError } from "./auth";
 import { UnauthorizedScreen } from "./UnauthorizedScreen";
-import { harnessLabel, harnessOrder, type HarnessDescriptor, type HostInfo, type SessionInfo, type SessionsResponse } from "./session-types";
+import { harnessLabel, harnessOrder, type HostInfo, type SessionInfo, type SessionsResponse } from "./session-types";
 
 const sessionsPollMs = 5_000;
 const healthPollMs = 5_000;
@@ -31,22 +31,6 @@ function relativeTime(updatedAt: number): string {
 
 function openSession(key: string) {
   window.location.href = `/?session=${encodeURIComponent(key)}`;
-}
-
-function harnessTile(harness: HarnessDescriptor, prefix: string) {
-  const description = "New chat in your home folder";
-  return (
-    <button
-      key={harness.id}
-      type="button"
-      className="hub-tile"
-      disabled={!harness.available}
-      onClick={() => openSession(`${prefix}new:${harness.id}`)}
-    >
-      <span className="hub-tile__label">{harness.label}</span>
-      <span className="hub-tile__desc">{harness.available ? description : "not installed"}</span>
-    </button>
-  );
 }
 
 function stateDot(session: SessionInfo): { className: string; label: string } {
@@ -164,68 +148,106 @@ function RemotePanel({ onClose }: { onClose: () => void }) {
   );
 }
 
-function HostSection({ host, sessions, multiHost }: { host: HostInfo; sessions: SessionInfo[]; multiHost: boolean }) {
-  const prefix = host.id ? `@${host.id}/` : "";
-  const harnesses = [...host.harnesses].sort((a, b) => harnessOrder.indexOf(a.id) - harnessOrder.indexOf(b.id));
-  const groups = new Map<string, SessionInfo[]>();
-  for (const session of sessions) {
-    const list = groups.get(session.cwd) ?? [];
-    list.push(session);
-    groups.set(session.cwd, list);
-  }
-  const groupEntries = [...groups.entries()].sort(
-    (a, b) => Math.max(...b[1].map((s) => s.updatedAt)) - Math.max(...a[1].map((s) => s.updatedAt)),
+const selectedMachineKey = "meldivo.machine";
+const pageSize = 40;
+
+function hostKeyPrefix(host: HostInfo): string {
+  return host.id ? `@${host.id}/` : "";
+}
+
+function MachineCard({ host, sessions, selected, onSelect }: { host: HostInfo; sessions: SessionInfo[]; selected: boolean; onSelect: () => void }) {
+  const open = sessions.filter((session) => session.open).length;
+  const busy = sessions.some((session) => session.busy);
+  const latest = sessions.reduce((max, session) => Math.max(max, session.updatedAt), 0);
+  const dot = !host.online ? "hub-dot--idle" : busy ? "hub-dot--busy" : "hub-dot--online";
+  return (
+    <button type="button" role="tab" aria-selected={selected} className={`hub-machine${selected ? " hub-machine--selected" : ""}${host.online ? "" : " hub-machine--offline"}`} onClick={onSelect}>
+      <span className="hub-machine__name"><span className={`hub-dot ${dot}`} aria-hidden="true" />{host.name}</span>
+      <span className="hub-machine__meta">
+        {host.online
+          ? <>{sessions.length} session{sessions.length === 1 ? "" : "s"}{open > 0 && <> · {open} open</>}</>
+          : "offline"}
+      </span>
+      {host.online && latest > 0 && <span className="hub-machine__meta">active {relativeTime(latest)}</span>}
+    </button>
   );
+}
+
+function MachinePanel({ host, sessions }: { host: HostInfo; sessions: SessionInfo[] }) {
+  const [query, setQuery] = useState("");
+  const [openOnly, setOpenOnly] = useState(false);
+  const [limit, setLimit] = useState(pageSize);
+  useEffect(() => { setQuery(""); setOpenOnly(false); setLimit(pageSize); }, [host.id]);
+
+  if (!host.online) {
+    return <p className="hub-empty">{host.name} is offline. Its sessions appear here as soon as it reconnects.</p>;
+  }
+
+  const prefix = hostKeyPrefix(host);
+  const harnesses = [...host.harnesses].sort((a, b) => harnessOrder.indexOf(a.id) - harnessOrder.indexOf(b.id));
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const matches = sessions
+    .filter((session) => !openOnly || session.open)
+    .filter((session) => {
+      if (terms.length === 0) return true;
+      const haystack = `${session.title} ${shortenCwd(session.cwd)} ${harnessLabel[session.harness]}`.toLowerCase();
+      return terms.every((term) => haystack.includes(term));
+    })
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const openCount = sessions.filter((session) => session.open).length;
 
   return (
-    <div className={multiHost ? "hub-host" : undefined}>
-      {multiHost && (
-        <h2 className="hub-host__title">
-          <span className={host.online ? "hub-dot hub-dot--open" : "hub-dot hub-dot--idle"} aria-hidden="true" />
-          {host.name}
-          {!host.online && <span className="hub-muted"> offline</span>}
-        </h2>
-      )}
-      {host.online && (
-        <>
-          <section className="hub-section">
-            <h2>Start a conversation</h2>
-            <div className="hub-tiles">
-              {harnesses.map((harness) => harnessTile(harness, prefix))}
-              {harnesses.length === 0 && <p className="hub-muted">No harnesses detected on this machine.</p>}
-            </div>
-          </section>
+    <div className="hub-panel" role="tabpanel">
+      <div className="hub-new" aria-label="Start a new chat">
+        {harnesses.map((harness) => (
+          <button key={harness.id} type="button" className="hub-new__button" disabled={!harness.available}
+            title={harness.available ? "New chat in the home folder" : "Not installed"}
+            aria-label={`New ${harness.label} chat`}
+            onClick={() => openSession(`${prefix}new:${harness.id}`)}>
+            <span aria-hidden="true">+ </span>{harness.label}
+          </button>
+        ))}
+        {harnesses.length === 0 && <span className="hub-muted">No coding agents on this machine.</span>}
+      </div>
 
-          <section className="hub-section">
-            <h2>Sessions</h2>
-            {sessions.length === 0 && <p className="hub-muted">No sessions yet. Tap a tile above to start one.</p>}
-            {groupEntries.map(([cwd, group]) => (
-              <div key={cwd} className="hub-group">
-                <h3 className="hub-group__title">{shortenCwd(cwd)}</h3>
-                <ul className="hub-sessions">
-                  {group.sort((a, b) => b.updatedAt - a.updatedAt).map((session) => {
-                    const dot = stateDot(session);
-                    return (
-                      <li key={session.key}>
-                        <button type="button" className="hub-session" onClick={() => openSession(session.key)}>
-                          <span className={dot.className} aria-hidden="true" title={dot.label} />
-                          <span className="hub-session__body">
-                            <span className="hub-session__title">{session.title}</span>
-                            <span className="hub-session__meta">
-                              <span className="hub-session__badge">{harnessLabel[session.harness]}</span>
-                              <span>{relativeTime(session.updatedAt)}</span>
-                            </span>
-                            {session.open && <span className="hub-session__hint">continues as a voice copy</span>}
-                          </span>
-                        </button>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </div>
-            ))}
-          </section>
-        </>
+      {sessions.length > 0 && (
+        <div className="hub-search">
+          <input type="search" className="hub-search__input" placeholder={`Search ${sessions.length} sessions`} value={query}
+            onChange={(event) => { setQuery(event.target.value); setLimit(pageSize); }} aria-label="Search sessions" autoComplete="off" />
+          <button type="button" className={`hub-chip${openOnly ? " hub-chip--on" : ""}`} aria-pressed={openOnly}
+            onClick={() => { setOpenOnly(!openOnly); setLimit(pageSize); }} disabled={openCount === 0 && !openOnly}>
+            Open now{openCount > 0 ? ` ${openCount}` : ""}
+          </button>
+        </div>
+      )}
+
+      {sessions.length === 0 && <p className="hub-empty">No sessions yet. Start a new chat above.</p>}
+      {sessions.length > 0 && matches.length === 0 && <p className="hub-empty">No sessions match.</p>}
+      <ul className="hub-sessions">
+        {matches.slice(0, limit).map((session) => {
+          const dot = stateDot(session);
+          return (
+            <li key={session.key}>
+              <button type="button" className="hub-session" onClick={() => openSession(session.key)}>
+                <span className={dot.className} aria-hidden="true" title={dot.label} />
+                <span className="hub-session__body">
+                  <span className="hub-session__title">{session.title || "(untitled)"}</span>
+                  <span className="hub-session__meta">
+                    <span className="hub-session__badge">{harnessLabel[session.harness]}</span>
+                    <span className="hub-session__cwd">{shortenCwd(session.cwd)}</span>
+                    <span className="hub-session__time">{relativeTime(session.updatedAt)}</span>
+                  </span>
+                  {session.open && <span className="hub-session__hint">open in a terminal · continues as a voice copy</span>}
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      {matches.length > limit && (
+        <button type="button" className="hub-more" onClick={() => setLimit(limit + pageSize)}>
+          Show more ({matches.length - limit})
+        </button>
       )}
     </div>
   );
@@ -237,6 +259,9 @@ export default function Hub() {
   const [unauthorized, setUnauthorized] = useState(false);
   const [speechHealth, setSpeechHealth] = useState<SpeechHealth>({ ready: true, downloading: false });
   const [remoteOpen, setRemoteOpen] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(() => {
+    try { return window.localStorage.getItem(selectedMachineKey); } catch { return null; }
+  });
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -300,10 +325,16 @@ export default function Hub() {
   if (unauthorized) return <UnauthorizedScreen />;
 
   const allHosts: HostInfo[] = data?.hosts ?? (data ? [{ id: "", name: data.machine, online: true, harnesses: data.harnesses }] : []);
+  const allSessions = data?.sessions ?? [];
+  const sessionsOf = (host: HostInfo) => allSessions.filter((session) => (session.host ?? "") === host.id);
   // A hub with no agents of its own (e.g. a small always-on box) only lists the machines that joined it.
   const hosts = allHosts.filter((host) => host.id !== "" || allHosts.length === 1
-    || host.harnesses.some((harness) => harness.available) || (data?.sessions ?? []).some((session) => !session.host));
-  const multiHost = hosts.length > 1;
+    || host.harnesses.some((harness) => harness.available) || sessionsOf(host).length > 0);
+  const selected = hosts.find((host) => host.id === selectedId) ?? hosts.find((host) => host.online) ?? hosts[0];
+  const select = (id: string) => {
+    setSelectedId(id);
+    try { window.localStorage.setItem(selectedMachineKey, id); } catch { /* storage may be unavailable */ }
+  };
   const speechStatusLabel = speechHealth.ready
     ? "Speech ready"
     : speechHealth.downloading
@@ -313,7 +344,7 @@ export default function Hub() {
   return (
     <main className="hub-page">
       <header className="hub-header">
-        <h1>{multiHost ? "Meldivo" : data?.machine ?? "Meldivo"}</h1>
+        <h1>{hosts.length > 1 ? "Meldivo" : data?.machine ?? "Meldivo"}</h1>
         <p className={`hub-speech-status${speechHealth.ready ? "" : " hub-speech-status--warn"}`} role="status">
           {speechHealth.error || speechStatusLabel}
         </p>
@@ -321,15 +352,17 @@ export default function Hub() {
       </header>
 
       {error && <p className="hub-error" role="alert">{error}</p>}
+      {!data && !error && <p className="hub-empty">Loading…</p>}
 
-      {hosts.map((host) => (
-        <HostSection
-          key={host.id || "local"}
-          host={host}
-          multiHost={multiHost}
-          sessions={(data?.sessions ?? []).filter((session) => (session.host ?? "") === host.id)}
-        />
-      ))}
+      {hosts.length > 1 && (
+        <nav className="hub-machines" role="tablist" aria-label="Machines">
+          {hosts.map((host) => (
+            <MachineCard key={host.id || "local"} host={host} sessions={sessionsOf(host)} selected={host === selected} onSelect={() => select(host.id)} />
+          ))}
+        </nav>
+      )}
+
+      {selected && <MachinePanel host={selected} sessions={sessionsOf(selected)} />}
 
       {remoteOpen && <RemotePanel onClose={() => setRemoteOpen(false)} />}
     </main>
