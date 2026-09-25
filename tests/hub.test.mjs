@@ -67,10 +67,10 @@ async function* erroringTurn(message) {
   yield { type: "error", message };
 }
 
-function httpsGet(url) {
+function httpsGet(url, headers = {}) {
   return new Promise((resolve, reject) => {
     https
-      .get(url, { rejectUnauthorized: false }, (res) => {
+      .get(url, { rejectUnauthorized: false, headers }, (res) => {
         let body = "";
         res.on("data", (chunk) => (body += chunk));
         res.on("end", () => resolve({ status: res.statusCode, body }));
@@ -150,21 +150,52 @@ test("Meldivo hub: auth and /api/sessions shape", async (t) => {
   t.after(() => server.close());
   const base = `http://127.0.0.1:${server.port}`;
 
-  await t.test("health is unauthenticated", async () => {
-    const response = await fetch(`${base}/api/health`);
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.ok, true);
+  await t.test("nothing is served without the secret: API is 404, pages get the bare lock screen", async () => {
+    const health = await fetch(`${base}/api/health`);
+    assert.equal(health.status, 404);
+    const page = await fetch(`${base}/`);
+    assert.equal(page.status, 401);
+    assert.equal(page.headers.get("cache-control"), "no-store");
+    const html = await page.text();
+    assert.match(html, /\/api\/unlock/);
+    assert.doesNotMatch(html, /meldivo|Meldivo/);
   });
 
-  await t.test("every other route requires the bearer secret", async () => {
+  await t.test("health works with the secret", async () => {
+    const response = await fetch(`${base}/api/health`, { headers: { "x-meldivo-token": secret } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).ok, true);
+    assert.equal(response.headers.get("cache-control"), "private, no-cache");
+  });
+
+  await t.test("unlock exchanges the key for an HttpOnly session cookie", async () => {
+    const wrong = await fetch(`${base}/api/unlock`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: "wrong" }),
+    });
+    assert.equal(wrong.status, 401);
+    assert.equal(wrong.headers.get("set-cookie"), null);
+    const right = await fetch(`${base}/api/unlock`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: secret }),
+    });
+    assert.equal(right.status, 204);
+    const cookie = right.headers.get("set-cookie");
+    assert.match(cookie, /HttpOnly/);
+    assert.match(cookie, /SameSite=Strict/);
+    assert.doesNotMatch(cookie, new RegExp(secret));
+    const sessions = await fetch(`${base}/api/sessions`, { headers: { cookie: cookie.split(";")[0] } });
+    assert.equal(sessions.status, 200);
+    const forged = await fetch(`${base}/api/sessions`, { headers: { cookie: "meldivo_session=forged" } });
+    assert.equal(forged.status, 404);
+  });
+
+  await t.test("every other route requires the secret", async () => {
     const response = await fetch(`${base}/api/sessions`);
-    assert.equal(response.status, 401);
+    assert.equal(response.status, 404);
   });
 
   await t.test("rejects a wrong secret too", async () => {
     const response = await fetch(`${base}/api/sessions`, { headers: { authorization: "Bearer wrong" } });
-    assert.equal(response.status, 401);
+    assert.equal(response.status, 404);
   });
 
   await t.test("lists sessions and harness availability", async () => {
@@ -185,7 +216,7 @@ test("Meldivo hub: auth and /api/sessions shape", async (t) => {
     const ok = await fetch(`${base}/api/sessions`, { headers: { "x-meldivo-token": secret, authorization: "Basic dTpw" } });
     assert.equal(ok.status, 200);
     const wrong = await fetch(`${base}/api/sessions`, { headers: { "x-meldivo-token": "wrong" } });
-    assert.equal(wrong.status, 401);
+    assert.equal(wrong.status, 404);
   });
 });
 
@@ -452,7 +483,7 @@ test("Meldivo hub: voice endpoints", async (t) => {
       headers: { "content-type": "audio/wav" },
       body: wav,
     });
-    assert.equal(response.status, 401);
+    assert.equal(response.status, 404);
   });
 
   await t.test("transcribes audio through the fake speech engine", async () => {
@@ -525,7 +556,7 @@ test("Meldivo hub: voice endpoints", async (t) => {
   });
 });
 
-test("Meldivo remote: 401 without secret, and the certificate path serves HTTPS via a user-supplied cert", async (t) => {
+test("Meldivo remote: 404 without secret, and the certificate path serves HTTPS via a user-supplied cert", async (t) => {
   const configHome = mkdtempSync(path.join(tmpdir(), "meldivo-tls-"));
   const tlsDir = path.join(configHome, "meldivo", "tls");
   mkdirSync(tlsDir, { recursive: true });
@@ -558,7 +589,7 @@ test("Meldivo remote: 401 without secret, and the certificate path serves HTTPS 
 
   await t.test("rejects GET /api/remote without the secret", async () => {
     const response = await fetch(`${base}/api/remote`);
-    assert.equal(response.status, 401);
+    assert.equal(response.status, 404);
   });
 
   let httpsPort;
@@ -579,7 +610,7 @@ test("Meldivo remote: 401 without secret, and the certificate path serves HTTPS 
   });
 
   await t.test("serves /api/health over HTTPS using the certificate", async () => {
-    const response = await httpsGet(`https://127.0.0.1:${httpsPort}/api/health`);
+    const response = await httpsGet(`https://127.0.0.1:${httpsPort}/api/health`, { "x-meldivo-token": secret });
     assert.equal(response.status, 200);
     assert.equal(JSON.parse(response.body).ok, true);
   });

@@ -132,7 +132,7 @@ async function waitForHealth(port, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/health`);
+      const response = await fetch(`http://127.0.0.1:${port}/api/health`, { headers: { "X-Meldivo-Token": ensureSecret() } });
       if (response.ok) return await response.json();
     } catch {
       // not up yet

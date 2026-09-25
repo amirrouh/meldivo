@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual as secureCompare } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import express from "express";
 import { createAdapters, listAllSessions } from "./harnesses/index.js";
 import type { HarnessAdapter, HarnessId, SendTarget, SessionInfo, TurnEvent } from "./harnesses/types.js";
+import { createAccessGate } from "./access.js";
 import { createLogger, requestLoggingMiddleware } from "./logger.js";
 import { detectRemoteOptions, RemoteManager, remoteGuideUrl, type RemoteId } from "./remote.js";
 import { createSherpaEngine, type SpeechEngine } from "./speech.js";
@@ -100,17 +101,13 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   app.use(requestLoggingMiddleware(logger));
   app.use(express.json({ limit: "1mb" }));
 
+  // Nothing is served without the secret: not the page, not even health (see access.ts).
+  const gate = createAccessGate(secret);
+  app.post("/api/unlock", gate.unlock);
+  app.use(gate.middleware);
+
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true, speech: speech.status() });
-  });
-
-  // Every other /api route requires the secret, compared timing-safe. The web app sends it as
-  // X-Meldivo-Token so it survives reverse proxies that use (and strip) Authorization for their
-  // own basic auth; a Bearer Authorization header is accepted as well.
-  app.use("/api", (req, res, next) => {
-    const token = req.get("x-meldivo-token") ?? req.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
-    if (!token || !secureTokenEqual(secret, token)) return res.status(401).json({ error: "Meldivo secret is required" });
-    next();
   });
 
   async function enableHttps(): Promise<number> {
@@ -524,11 +521,6 @@ function flush(res: express.Response, events: TurnEvent[]): void {
   for (const event of events) sendEvent(res, event);
 }
 
-function secureTokenEqual(expected: string, candidate: string): boolean {
-  const expectedBytes = Buffer.from(expected);
-  const candidateBytes = Buffer.from(candidate);
-  return expectedBytes.length === candidateBytes.length && secureCompare(expectedBytes, candidateBytes);
-}
 
 function readConversationId(value: unknown): string | undefined {
   return typeof value === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(value) ? value : undefined;

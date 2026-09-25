@@ -1036,7 +1036,7 @@ export default function App({ sessionKey }: AppProps) {
   useEffect(() => {
     let cancelled = false;
     const poll = () => {
-      void fetch("/api/health").then(async (response) => {
+      void fetch("/api/health", { headers: authHeaders() }).then(async (response) => {
         const result = await response.json().catch(() => ({})) as HealthResponse;
         if (cancelled) return;
         const speech = result.speech ?? {};
