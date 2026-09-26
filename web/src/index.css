@@ -15,6 +15,7 @@ button { font: inherit; }
 .room-header { position: fixed; z-index: 3; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 10px; padding: 14px 16px; color: rgb(224 228 238 / .85); font-size: 13px; }
 .room-header__back { flex: none; color: inherit; text-decoration: none; font-size: 18px; line-height: 1; }
 .room-header__back:hover, .room-header__back:focus-visible { color: #fff; outline: none; }
+.room-header__logo { flex: none; width: 22px; height: 22px; border-radius: 6px; }
 .room-header__title { font-weight: 600; }
 .room-header__cwd { color: rgb(208 214 228 / .55); font-size: 11px; }
 .room-status { position: fixed; z-index: 3; top: 88px; left: 50%; margin: 0; padding: 5px 10px; transform: translateX(-50%); border: 1px solid rgb(255 255 255 / .12); border-radius: 999px; background: rgb(13 15 21 / .8); color: rgb(208 214 228 / .82); font-size: 11px; white-space: nowrap; }
@@ -78,6 +79,8 @@ button { font: inherit; }
 .hub-page { min-height: 100vh; margin: 0 auto; padding: max(24px, env(safe-area-inset-top)) 20px 64px; max-width: 760px; overflow-x: clip; color: rgb(240 243 250); background: #050609; }
 .hub-header { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 24px; }
 .hub-header h1 { margin: 0; font-size: 20px; font-weight: 650; }
+.hub-title { display: flex; align-items: center; gap: 10px; }
+.hub-logo { flex: none; width: 30px; height: 30px; border-radius: 8px; }
 .hub-speech-status { margin: 0; color: rgb(128 232 189); font-size: 12px; }
 .hub-speech-status--warn { color: rgb(255 205 123); }
 .hub-remote-button { margin-left: auto; padding: 8px 13px; border: 1px solid rgb(255 255 255 / .16); border-radius: 999px; color: inherit; background: rgb(255 255 255 / .07); cursor: pointer; font-size: 12px; }

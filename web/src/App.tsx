@@ -1237,6 +1237,7 @@ export default function App({ sessionKey, folder }: AppProps) {
   return <main className="voice-page" data-state={state} style={{ "--level": level } as CSSProperties}>
     <header className="room-header">
       <a className="room-header__back" href="/" aria-label="Back to hub">←</a>
+      <img className="room-header__logo" src="/logo-192.png" alt="" width={22} height={22} />
       <span className="room-header__title">
         {sessionDisplay.harness ? harnessLabel[sessionDisplay.harness] : "Meldivo"} · {sessionDisplay.title}
       </span>

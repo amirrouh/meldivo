@@ -483,7 +483,7 @@ export default function Hub() {
   return (
     <main className="hub-page">
       <header className="hub-header">
-        <h1>{hosts.length > 1 ? "Meldivo" : data?.machine ?? "Meldivo"}</h1>
+        <h1 className="hub-title"><img className="hub-logo" src="/logo-192.png" alt="" width={30} height={30} />{hosts.length > 1 ? "Meldivo" : data?.machine ?? "Meldivo"}</h1>
         <p className={`hub-speech-status${speechHealth.ready ? "" : " hub-speech-status--warn"}`} role="status">
           {speechHealth.error || speechStatusLabel}
         </p>
