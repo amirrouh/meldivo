@@ -40,6 +40,17 @@ async function fakeSpeechServer(t, { key } = {}) {
       }
       const json = (value) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(value)); };
       const url = new URL(req.url, "http://x");
+      // Paths under /breeze answer like a Breeze-TTS-2.cpp server: saved voices, streamed PCM.
+      if (url.pathname.startsWith("/breeze/")) {
+        const sub = url.pathname.slice("/breeze".length);
+        if (sub === "/health") return json({ status: "ok", sample_rate: 24000 });
+        if (sub === "/v1/voices") return json([{ id: "narrator_uk", saved: true }]);
+        if (sub === "/v1/audio/speech") {
+          res.writeHead(200, { "Content-Type": "audio/pcm", "X-Sample-Rate": "24000" });
+          res.write(Buffer.alloc(240));
+          return setTimeout(() => res.end(Buffer.alloc(240)), 20);
+        }
+      }
       if (url.pathname === "/v1/models" && url.searchParams.get("task") === "text-to-speech") {
         return json({ data: [{ id: "speaches-ai/Kokoro-82M-v1.0-ONNX", voices: [{ name: "af_heart" }, { name: "am_adam" }] }] });
       }
@@ -49,12 +60,6 @@ async function fakeSpeechServer(t, { key } = {}) {
       if (url.pathname === "/v1/registry") return json({ data: [{ id: "istupakov/parakeet-tdt-0.6b-v3-onnx" }] });
       if (url.pathname === "/v1/models") return json({ object: "list", data: [{ id: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" }] });
       if (url.pathname === "/v1/audio/voices") return json({ voices: ["vivian", "ryan"], uploaded_voices: [{ name: "my_voice" }] });
-      if (url.pathname === "/health") return json({ status: "ok", sample_rate: 24000 });
-      if (url.pathname === "/v1/voices") return json([{ id: "narrator_uk", frames: 46, saved: true }]);
-      if (url.pathname === "/breeze/v1/audio/speech") {
-        res.writeHead(200, { "Content-Type": "audio/pcm", "X-Sample-Rate": "24000" });
-        return res.end(Buffer.alloc(480));
-      }
       if (url.pathname === "/v1/references/list") return json({ success: true, reference_ids: ["narrator"] });
       if (url.pathname === "/v1/audio/speech" || url.pathname === "/v1/tts") {
         res.writeHead(200, { "Content-Type": "audio/wav" });
@@ -112,7 +117,7 @@ test("discover loads models and speakers per engine", async (t) => {
   assert.equal(speaches.model, "speaches-ai/Kokoro-82M-v1.0-ONNX");
   assert.deepEqual(speaches.voices, ["af_heart", "am_adam"]);
   assert.equal(speaches.voice, "af_heart");
-  const breeze = await discover("tts", { engine: "breeze", url });
+  const breeze = await discover("tts", { engine: "breeze", url: `${url}/breeze` });
   assert.deepEqual(breeze, { models: [], voices: ["narrator_uk"], voice: "narrator_uk" });
   const fish = await discover("tts", { engine: "fish-speech", url });
   assert.deepEqual(fish.voices, ["default", "narrator"]);
@@ -209,4 +214,31 @@ test("hub speech settings: saved per hub, key kept on the server, used for voice
 
   const bad = await call("/api/speech/settings", { method: "PUT", body: JSON.stringify({ tts: { engine: "vllm-omni", url: "ftp://x" }, stt }) });
   assert.equal(bad.status, 400);
+});
+
+test("voice speech streams PCM from a streaming engine when the browser accepts it", async (t) => {
+  const speechServer = await fakeSpeechServer(t);
+  const configDir = mkdtempSync(path.join(tmpdir(), "meldivo-config-"));
+  const secret = "u".repeat(32);
+  const local = { async transcribe() { return ""; }, async synthesize() { return Buffer.from("RIFFlocal"); }, voices: () => ["af_heart"], defaultVoice: "af_heart", status: () => ({ ready: true, downloading: false }) };
+  const server = await startServer({ port: 0, secret, speech: local, webDir: "/does/not/exist", adapters: [], configDir, stateDir: mkdtempSync(path.join(tmpdir(), "meldivo-state-")), hubLink: null });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.port}`;
+  const call = (pathName, init = {}) => fetch(`${base}${pathName}`, { ...init, headers: { "x-meldivo-token": secret, "Content-Type": "application/json", ...init.headers } });
+  const saved = await call("/api/speech/settings", { method: "PUT", body: JSON.stringify({ tts: { engine: "breeze", url: `${speechServer.url}/breeze`, voice: "narrator_uk" }, stt: { engine: "local" } }) });
+  assert.equal(saved.status, 200);
+
+  const streamed = await call("/api/voice/speech", { method: "POST", headers: { Accept: "audio/pcm, audio/wav;q=0.9" }, body: JSON.stringify({ text: "Hello" }) });
+  assert.equal(streamed.status, 200);
+  assert.equal(streamed.headers.get("content-type"), "audio/pcm");
+  assert.equal(streamed.headers.get("x-sample-rate"), "24000");
+  assert.equal((await streamed.arrayBuffer()).byteLength, 480);
+  assert.match(speechServer.seen.at(-1).body.toString("latin1"), /name="voice_id"\r\n\r\nnarrator_uk/);
+
+  // Without audio/pcm in Accept, the same engine still answers with a complete WAV file.
+  const whole = await call("/api/voice/speech", { method: "POST", headers: { Accept: "audio/wav" }, body: JSON.stringify({ text: "Hello" }) });
+  assert.equal(whole.headers.get("content-type"), "audio/wav");
+  const wav = Buffer.from(await whole.arrayBuffer());
+  assert.equal(wav.toString("ascii", 0, 4), "RIFF");
+  assert.equal(wav.readUInt32LE(40), 480);
 });

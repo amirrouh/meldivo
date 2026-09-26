@@ -638,6 +638,30 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     if (req.body?.voice !== undefined && !requestedVoice) return res.status(400).json({ error: "voice must be a valid provider voice ID" });
 
     const controller = abortOnDisconnect(req, res);
+    // A browser that can play raw PCM gets the audio as the server generates it.
+    if (req.accepts(["audio/pcm", "audio/wav"]) === "audio/pcm") {
+      let stream;
+      try {
+        stream = await speech.synthesizeStream(text, requestedVoice ?? speech.defaultVoice, controller.signal);
+      } catch (error) {
+        if (!controller.signal.aborted && !res.destroyed) res.status(502).json({ error: messageFor(error) });
+        return;
+      }
+      if (stream) {
+        res.writeHead(200, { "Content-Type": "audio/pcm", "X-Sample-Rate": String(stream.sampleRate), "X-Sample-Format": "s16le", "Cache-Control": "no-store", "X-Accel-Buffering": "no" });
+        res.flushHeaders();
+        try {
+          for await (const chunk of stream.chunks) {
+            if (controller.signal.aborted || res.destroyed) break;
+            res.write(chunk);
+          }
+        } catch {
+          // Headers are gone; ending early tells the browser the phrase was cut short.
+        }
+        if (!res.destroyed) res.end();
+        return;
+      }
+    }
     try {
       const wav = await speech.synthesize(text, requestedVoice ?? speech.defaultVoice, controller.signal);
       if (!controller.signal.aborted && !res.destroyed) {

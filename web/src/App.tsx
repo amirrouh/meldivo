@@ -4,7 +4,7 @@ import { removeAssistantEcho } from "./assistant-echo";
 import { isCurrentVoiceSession, SerializedVadTransitions, VoiceInputCoordinator } from "./input-coordinator";
 import { LiveTranscription } from "./live-transcription";
 import { BargeInGuard } from "./barge-in-guard";
-import { prepareAudioBuffer } from "./audio-playback";
+import { prepareAudioBuffer, prepareAudioStream } from "./audio-playback";
 import { SpeechPipeline, type PreparedSpeech } from "./speech-pipeline";
 import { vadOptions } from "./vad-config";
 import { EnergyVad } from "./energy-vad";
@@ -388,7 +388,7 @@ export default function App({ sessionKey, folder }: AppProps) {
       startMeter(analyser, playback);
     };
     const response = await fetch("/api/voice/speech", {
-      method: "POST", headers: { "Content-Type": "application/json", Accept: "audio/wav", ...authHeaders() },
+      method: "POST", headers: { "Content-Type": "application/json", Accept: "audio/pcm, audio/wav;q=0.9", ...authHeaders() },
       body: JSON.stringify({
         text,
         ...(turnVoice.current ? { voice: turnVoice.current } : {}),
@@ -399,16 +399,23 @@ export default function App({ sessionKey, folder }: AppProps) {
       clearVoicePreference();
     }
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? "Speech generation failed.");
-    const bytes = await response.arrayBuffer();
-    signal.throwIfAborted();
-    const buffer = await context.decodeAudioData(bytes);
-    signal.throwIfAborted();
-    const prepared = prepareAudioBuffer(
-      buffer,
-      context,
-      outputGain.current ?? context.destination,
-      playbackStarted,
-    );
+    let prepared: PreparedSpeech;
+    if (response.body && response.headers.get("content-type")?.startsWith("audio/pcm")) {
+      // Streamed: start playing the first words while the rest of the phrase is still being made.
+      const sampleRate = Number(response.headers.get("x-sample-rate")) || 24_000;
+      prepared = await prepareAudioStream(response.body, sampleRate, context, outputGain.current ?? context.destination, playbackStarted, signal);
+    } else {
+      const bytes = await response.arrayBuffer();
+      signal.throwIfAborted();
+      const buffer = await context.decodeAudioData(bytes);
+      signal.throwIfAborted();
+      prepared = prepareAudioBuffer(
+        buffer,
+        context,
+        outputGain.current ?? context.destination,
+        playbackStarted,
+      );
+    }
     const play = (async (playbackSignal: AbortSignal) => {
       try { await prepared(playbackSignal); }
       finally { stopMeter(playback); syncState(); }

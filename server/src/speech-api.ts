@@ -504,6 +504,57 @@ export async function synthesizeWith(setting: EngineSetting, text: string, voice
   return readAudio(response);
 }
 
+/** Raw 16-bit mono little-endian PCM, delivered as the server produces it. */
+export interface SpeechStream {
+  sampleRate: number;
+  chunks: AsyncIterable<Uint8Array>;
+}
+
+// Engines whose servers stream raw PCM at a known rate; the rest answer with a finished file.
+const KOKORO_FASTAPI_RATE = 24_000;
+
+async function* limitedChunks(body: ReadableStream<Uint8Array>): AsyncIterable<Uint8Array> {
+  let total = 0;
+  for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
+    total += chunk.length;
+    if (total > MAX_AUDIO_BYTES) throw new Error("The speech server sent too much audio");
+    yield chunk;
+  }
+}
+
+/**
+ * Starts synthesis and hands back the audio as it streams in, so the first words can play
+ * while the rest of the sentence is still being generated. Undefined when this engine can't stream.
+ */
+export async function synthesizeStreamWith(setting: EngineSetting, text: string, voice: string | undefined, signal?: AbortSignal): Promise<SpeechStream | undefined> {
+  let response: Response;
+  if (setting.engine === "breeze") {
+    const form = new FormData();
+    form.append("text", text);
+    if (voice) form.append("voice_id", voice);
+    form.append("seed", "42");
+    response = await request(setting, "/v1/audio/speech", { method: "POST", body: form, timeoutMs: SPEECH_TIMEOUT_MS, signal });
+  } else if (setting.engine === "kokoro-fastapi") {
+    response = await request(setting, "/v1/audio/speech", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: setting.model ?? "kokoro", input: text, ...(voice ? { voice } : {}), response_format: "pcm", stream: true }),
+      timeoutMs: SPEECH_TIMEOUT_MS,
+      signal,
+    });
+  } else {
+    return undefined;
+  }
+  if (!response.ok) throw new Error(await describeFailure(response));
+  const type = response.headers.get("content-type") ?? "";
+  if (!response.body || !/audio\/(pcm|l16)|octet-stream/i.test(type)) {
+    await response.body?.cancel();
+    return undefined;
+  }
+  const sampleRate = Number(response.headers.get("x-sample-rate")) || (setting.engine === "kokoro-fastapi" ? KOKORO_FASTAPI_RATE : 24_000);
+  return { sampleRate, chunks: limitedChunks(response.body) };
+}
+
 export async function transcribeWith(setting: EngineSetting, wav: Buffer, signal?: AbortSignal): Promise<string> {
   const form = () => {
     const data = new FormData();
@@ -531,6 +582,8 @@ export interface ConfigurableSpeech extends SpeechEngine {
   listVoices(): Promise<string[]>;
   /** Whether either direction still uses the on-device models. */
   usesLocal(): boolean;
+  /** Streamed synthesis when the configured server supports it, otherwise undefined. */
+  synthesizeStream(text: string, voice: string, signal?: AbortSignal): Promise<SpeechStream | undefined>;
 }
 
 /** Routes each direction to its configured server, or to `local` when it is set to on-device. */
@@ -548,6 +601,12 @@ export function withSpeechSettings(local: SpeechEngine, store: SpeechSettingsSto
       cachedFor = key(tts);
     }
     return cachedVoices;
+  };
+
+  // A browser may still remember a speaker from another engine; fall back to the hub's choice.
+  const chooseVoice = async (tts: EngineSetting, voice: string): Promise<string | undefined> => {
+    const voices = await refreshVoices().catch(() => cachedVoices);
+    return voices.includes(voice) ? voice : tts.voice ?? voices[0];
   };
 
   const track = async <T>(work: Promise<T>): Promise<T> => {
@@ -591,10 +650,12 @@ export function withSpeechSettings(local: SpeechEngine, store: SpeechSettingsSto
         const localVoice = local.voices().includes(voice) ? voice : tts.voice && local.voices().includes(tts.voice) ? tts.voice : local.defaultVoice;
         return local.synthesize(text, localVoice, signal);
       }
-      // A browser may still remember a speaker from another engine; fall back to the hub's choice.
-      const voices = await refreshVoices().catch(() => cachedVoices);
-      const chosen = voices.includes(voice) ? voice : tts.voice ?? voices[0];
-      return track(synthesizeWith(tts, text, chosen, signal));
+      return track(synthesizeWith(tts, text, await chooseVoice(tts, voice), signal));
+    },
+    synthesizeStream: async (text, voice, signal) => {
+      const tts = store.get().tts;
+      if (tts.engine === "local") return undefined;
+      return track(synthesizeStreamWith(tts, text, await chooseVoice(tts, voice), signal));
     },
   };
 }
