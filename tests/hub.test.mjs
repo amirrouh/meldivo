@@ -662,3 +662,30 @@ test("Meldivo remote: 404 without secret, and the certificate path serves HTTPS 
     await assert.rejects(() => httpsGet(`https://127.0.0.1:${httpsPort}/api/health`));
   });
 });
+
+test("warm-up reads an open session into its voice fork, and the next voice turn continues that fork", async (t) => {
+  const secret = "w".repeat(32);
+  const pi = fakeAdapter("pi", "Pi", {
+    sessions: [{ key: "pi:live", harness: "pi", id: "live", title: "Busy", cwd: "/work", updatedAt: 1, open: true }],
+  });
+  pi.queueSend(() => okTurn("voice-fork", ["ready"]));
+  pi.queueSend(() => okTurn("voice-fork", ["Yes, I can hear you."]));
+  const server = await startServer({ port: 0, secret, speech: fakeSpeechEngine(), webDir: "/does/not/exist", adapters: [pi], stateDir: tmpStateDir() });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.port}`;
+  const headers = { "x-meldivo-token": secret, "Content-Type": "application/json" };
+
+  const warm = await fetch(`${base}/api/sessions/pi%3Alive/warm`, { method: "POST", headers });
+  assert.equal(warm.status, 200);
+  assert.equal((await warm.json()).warmed, true);
+  assert.deepEqual(pi.calls[0].target, { id: "live", cwd: "/work", model: undefined, fork: true });
+  assert.match(pi.calls[0].text, /Voice check/);
+
+  const events = await readSseUntilDone(await fetch(`${base}/api/sessions/pi%3Alive/chat`, { method: "POST", headers, body: JSON.stringify({ message: "can you hear me" }) }));
+  assert.ok(events.some((event) => event.type === "delta"));
+  // The terminal's session is never written to: the turn continues the fork the warm-up made.
+  assert.deepEqual(pi.calls[1].target, { id: "voice-fork", cwd: "/work", model: undefined, fork: false });
+
+  const skipped = await fetch(`${base}/api/sessions/new%3Api/warm`, { method: "POST", headers });
+  assert.equal((await skipped.json()).warmed, false);
+});

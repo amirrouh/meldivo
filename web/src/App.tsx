@@ -68,7 +68,7 @@ function getConversationId(sessionKey: string): string {
   }
 }
 
-type VoiceState = "idle" | "listening" | "hearing" | "thinking" | "running" | "speaking" | "muted" | "error";
+type VoiceState = "idle" | "loading" | "listening" | "hearing" | "thinking" | "running" | "speaking" | "muted" | "error";
 const acceptedSpeechWatchdogMs = 12_000;
 const longPressMs = 560;
 const previewText = "This is a voice preview.";
@@ -247,7 +247,28 @@ export default function App({ sessionKey, folder }: AppProps) {
     if (speaking.current) updateState("speaking");
     else if (pipeline.current?.busy && stateRef.current === "speaking") updateState("speaking");
     else if (chat.current || pipeline.current?.busy || input.current?.busy) updateState(harnessTurnActive.current ? "running" : "thinking");
+    else if (warming.current) updateState("loading");
     else if (started.current) updateState("listening");
+  };
+  // Has the agent's model read the whole conversation before the user speaks, so the first
+  // reply only has to read the new sentence. The server runs it on a throwaway fork.
+  const warming = useRef(false);
+  const warmConversation = async () => {
+    const key = liveKey.current;
+    const { inner } = splitHostKey(key);
+    if (warming.current || !inner.includes(":") || inner.startsWith("new:")) return;
+    warming.current = true;
+    setStatusText("Reading the conversation…");
+    syncState();
+    try {
+      await fetch(`/api/sessions/${encodeURIComponent(key)}/warm`, { method: "POST", headers: authHeaders() });
+    } catch {
+      // The first turn is just slower; nothing to report.
+    } finally {
+      warming.current = false;
+      if (mounted.current) setStatusText("");
+      syncState();
+    }
   };
   const duckOutput = () => {
     const gain = outputGain.current;
@@ -956,6 +977,7 @@ export default function App({ sessionKey, folder }: AppProps) {
       }
       updateState("listening");
       if (settingsOpenRef.current) void pauseMicrophoneForSettings();
+      await warmConversation();
     } catch (caught) {
       const currentStartup = sessionEpoch.current === session && startupGeneration.current === startup;
       if (currentStartup) {

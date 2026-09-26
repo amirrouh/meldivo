@@ -377,7 +377,44 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     return deeper.find((session) => session.id === id);
   }
 
+  // Warm-up: before the user speaks, have the agent's model read the whole conversation, so the
+  // first spoken reply only reads the new sentence. It is a real one-line exchange appended to the
+  // exact history the voice turns continue (the voice fork of a session open in a terminal, or the
+  // session itself), because a model server can only reuse a cached conversation from where its
+  // previous request ended.
+  const WARM_PROMPT = "(Voice check from meldivo: the user is about to talk. Reply with only the word: ready.)";
+  const warming = new Map<string, Promise<void>>();
+
+  async function warmExisting(key: string, harness: HarnessId, id: string, signal: AbortSignal): Promise<void> {
+    const adapter = adapterById.get(harness);
+    if (!adapter) return;
+    const info = await findSession(harness, id);
+    if (!info) return;
+    const voiceFork = info.open ? await stateStore.getFork(key) : undefined;
+    const target = voiceFork
+      ? { id: voiceFork, cwd: info.cwd, model: info.model, fork: false }
+      : { id: info.id, cwd: info.cwd, model: info.model, fork: info.open };
+    // Stop the agent if it reaches for a tool instead of answering: a warm-up must never run commands.
+    const local = new AbortController();
+    const stop = () => local.abort();
+    signal.addEventListener("abort", stop, { once: true });
+    try {
+      for await (const event of adapter.send(target, WARM_PROMPT, local.signal)) {
+        // The first voice turn of an open session then continues this fork instead of making another.
+        if (event.type === "session" && target.fork && event.id !== info.id) await stateStore.setFork(key, event.id);
+        if (event.type === "tool" || event.type === "error") {
+          local.abort();
+          break;
+        }
+      }
+    } finally {
+      signal.removeEventListener("abort", stop);
+    }
+  }
+
   async function runExisting(key: string, harness: HarnessId, id: string, message: string, signal: AbortSignal, sink: TurnSink): Promise<void> {
+    // A voice turn started while its warm-up is still reading waits for it, then reuses its cache.
+    await warming.get(key)?.catch(() => undefined);
     const adapter = adapterById.get(harness);
     if (!adapter) {
       sink.send({ type: "error", message: `Unknown harness "${harness}"` });
@@ -482,6 +519,32 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     };
     await runTurn(key, message, conversationId, cwd, controller, sink);
     sink.end();
+  });
+
+  app.post("/api/sessions/:key/warm", async (req, res) => {
+    const key = req.params.key!;
+    const separator = key.indexOf(":");
+    const harness = key.slice(0, separator) as HarnessId;
+    const id = key.slice(separator + 1);
+    // New chats have nothing to read, and a joined machine's sessions are warmed on that machine by its own turns.
+    if (separator <= 0 || key.startsWith("@") || key.startsWith("new:") || !adapterById.has(harness)) {
+      return res.json({ warmed: false });
+    }
+    const started = Date.now();
+    let running = warming.get(key);
+    if (!running) {
+      const controller = new AbortController();
+      running = warmExisting(key, harness, id, controller.signal);
+      warming.set(key, running);
+      const timer = setTimeout(() => controller.abort(), 180_000);
+      void running.finally(() => { clearTimeout(timer); warming.delete(key); }).catch(() => undefined);
+    }
+    try {
+      await running;
+      res.json({ warmed: true, ms: Date.now() - started });
+    } catch (error) {
+      if (!res.destroyed) res.status(502).json({ error: messageFor(error) });
+    }
   });
 
   app.post("/api/sessions/:key/cancel", (req, res) => {
