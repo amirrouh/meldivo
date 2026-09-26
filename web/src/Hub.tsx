@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { authHeaders, checkAuthorized, UnauthorizedError } from "./auth";
 import { UnauthorizedScreen } from "./UnauthorizedScreen";
+import { SpeechSettingsPanel } from "./SpeechSettings";
 import { harnessLabel, harnessOrder, type HarnessId, type HostInfo, type SessionInfo, type SessionsResponse } from "./session-types";
 
 const sessionsPollMs = 5_000;
@@ -398,6 +399,7 @@ export default function Hub() {
   const [unauthorized, setUnauthorized] = useState(false);
   const [speechHealth, setSpeechHealth] = useState<SpeechHealth>({ ready: true, downloading: false });
   const [remoteOpen, setRemoteOpen] = useState(false);
+  const [speechOpen, setSpeechOpen] = useState(() => new URLSearchParams(window.location.search).get("settings") === "speech");
   const [selectedId, setSelectedId] = useState<string | null>(() => {
     try { return window.localStorage.getItem(selectedMachineKey); } catch { return null; }
   });
@@ -487,7 +489,8 @@ export default function Hub() {
         <p className={`hub-speech-status${speechHealth.ready ? "" : " hub-speech-status--warn"}`} role="status">
           {speechHealth.error || speechStatusLabel}
         </p>
-        <button type="button" className="hub-remote-button" onClick={() => setRemoteOpen(true)}>Phone access</button>
+        <button type="button" className="hub-remote-button" onClick={() => { setRemoteOpen(false); setSpeechOpen(true); }}>Speech</button>
+        <button type="button" className="hub-remote-button hub-remote-button--next" onClick={() => { setSpeechOpen(false); setRemoteOpen(true); }}>Phone access</button>
       </header>
 
       {error && <p className="hub-error" role="alert">{error}</p>}
@@ -504,6 +507,7 @@ export default function Hub() {
       {selected && <MachinePanel host={selected} sessions={sessionsOf(selected)} />}
 
       {remoteOpen && <RemotePanel onClose={() => setRemoteOpen(false)} />}
+      {speechOpen && <SpeechSettingsPanel onClose={() => setSpeechOpen(false)} />}
     </main>
   );
 }

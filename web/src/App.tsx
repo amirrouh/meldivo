@@ -1353,6 +1353,7 @@ export default function App({ sessionKey, folder }: AppProps) {
       </>}
       {voiceError && <p className="voice-settings__error" role="alert">{voiceError}</p>}
       {voiceNotice && <p className="voice-settings__notice" role="status">{voiceNotice}</p>}
+      <a className="voice-settings__advanced-link" href="/?settings=speech">Speech engines and servers…</a>
     </div>}
     {onboardingOpen && <div className="voice-onboarding" role="dialog" aria-modal="true" aria-labelledby="voice-onboarding-title">
       <div className="voice-onboarding__card">

@@ -16,6 +16,7 @@ import { loadHubLink, startMachineClient, type HubLink, type MachineClient } fro
 import { MACHINE_NAME, parseMachineKey } from "./protocol.js";
 import { detectRemoteOptions, RemoteManager, remoteGuideUrl, type RemoteId } from "./remote.js";
 import { createSherpaEngine, type SpeechEngine } from "./speech.js";
+import { discover, engineList, prepareSetting, publicSetting, readEngineSetting, SpeechSettingsStore, synthesizeWith, withSpeechSettings, type EngineSetting, type SpeechKind } from "./speech-api.js";
 import { defaultStateDir, SessionStateStore } from "./state.js";
 import { voicePrompt } from "./harnesses/voice-turn.js";
 
@@ -126,9 +127,12 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   // hub (a one-time code); both answer anything invalid with the same plain 404.
   const gate = createAccessGate(secret);
   const hub: Hub | undefined = options.hub ? createHub({ configDir, logger, notFound }) : undefined;
-  const speech = hub ? hubSpeech(localSpeech, hub, logger) : localSpeech;
+  const speechSettings = new SpeechSettingsStore(configDir);
+  const deviceSpeech = hub ? hubSpeech(localSpeech, hub, logger) : localSpeech;
+  const speech = withSpeechSettings(deviceSpeech, speechSettings);
   if (options.warmupSpeech) {
-    const warm = () => localSpeech.warmup?.().catch((error: unknown) => console.error("speech warmup failed:", error));
+    // Only download and load the on-device models when a direction still uses them.
+    const warm = () => speech.warmup?.().catch((error: unknown) => console.error("speech warmup failed:", error));
     // A hub with a speech machine never needs its own models, so give machines time to connect.
     if (hub) setTimeout(() => { if (!hub.speechMachine()) void warm(); }, 30_000).unref();
     else void warm();
@@ -552,8 +556,79 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     }
   });
 
-  app.get("/api/voice/voices", (_req, res) => {
-    res.set("Cache-Control", "no-store").json({ current: speech.defaultVoice, voices: speech.voices() });
+  app.get("/api/voice/voices", async (_req, res) => {
+    let voices: string[];
+    try {
+      voices = await speech.listVoices();
+    } catch (error) {
+      return res.set("Cache-Control", "no-store").json({ current: speech.defaultVoice, voices: speech.voices(), available: false, warning: messageFor(error) });
+    }
+    res.set("Cache-Control", "no-store").json({ current: speech.defaultVoice, voices });
+  });
+
+  // Hub-wide speech engines: on-device, or a speech server for either direction.
+  const settingsView = () => {
+    const current = speechSettings.get();
+    return {
+      tts: { engines: engineList("tts"), setting: publicSetting(current.tts) },
+      stt: { engines: engineList("stt"), setting: publicSetting(current.stt) },
+    };
+  };
+  // The browser never gets the saved API key back, so a request without one reuses it for the same server.
+  const withSavedKey = (kind: SpeechKind, body: unknown): EngineSetting | undefined => {
+    const setting = readEngineSetting(kind, body);
+    if (!setting || setting.engine === "local" || setting.apiKey) return setting;
+    const saved = speechSettings.get()[kind];
+    const clear = Boolean((body as Record<string, unknown>).clearKey);
+    return !clear && saved.apiKey && saved.engine === setting.engine && saved.url === setting.url ? { ...setting, apiKey: saved.apiKey } : setting;
+  };
+  const readKind = (value: unknown): SpeechKind | undefined => (value === "tts" || value === "stt" ? value : undefined);
+
+  app.get("/api/speech/settings", (_req, res) => {
+    res.set("Cache-Control", "no-store").json(settingsView());
+  });
+
+  app.put("/api/speech/settings", (req, res) => {
+    const tts = withSavedKey("tts", req.body?.tts);
+    const stt = withSavedKey("stt", req.body?.stt);
+    if (!tts || !stt) return res.status(400).json({ error: "Choose an engine and a valid server address (http:// or https://) for both directions" });
+    try {
+      speechSettings.set({ tts, stt });
+    } catch {
+      return res.status(500).json({ error: "Could not save the speech settings" });
+    }
+    prepareSetting(tts);
+    prepareSetting(stt);
+    if (options.warmupSpeech) void speech.warmup?.().catch(() => undefined);
+    logger.info("speech_settings_saved", { tts: tts.engine, stt: stt.engine });
+    res.set("Cache-Control", "no-store").json(settingsView());
+  });
+
+  app.post("/api/speech/discover", async (req, res) => {
+    const kind = readKind(req.body?.kind);
+    const setting = kind ? withSavedKey(kind, req.body?.setting) : undefined;
+    if (!kind || !setting) return res.status(400).json({ error: "Enter the server address, like http://localhost:8000" });
+    try {
+      res.set("Cache-Control", "no-store").json(await discover(kind, setting));
+    } catch (error) {
+      res.status(502).json({ error: messageFor(error) });
+    }
+  });
+
+  app.post("/api/speech/preview", async (req, res) => {
+    const setting = withSavedKey("tts", req.body?.setting);
+    const voice = readVoice(req.body?.voice);
+    if (!setting || !voice) return res.status(400).json({ error: "Choose a voice to preview" });
+    const text = readSpeechText(req.body?.text) ?? "Hi! This is how I will sound when I answer you.";
+    const controller = abortOnDisconnect(req, res);
+    try {
+      const wav = setting.engine === "local"
+        ? await deviceSpeech.synthesize(text, voice, controller.signal)
+        : await synthesizeWith(setting, text, voice, controller.signal);
+      if (!controller.signal.aborted && !res.destroyed) res.status(200).set({ "Content-Type": "audio/wav", "Cache-Control": "no-store" }).send(wav);
+    } catch (error) {
+      if (!controller.signal.aborted && !res.destroyed) res.status(502).json({ error: messageFor(error) });
+    }
   });
 
   app.post("/api/voice/speech", async (req, res) => {

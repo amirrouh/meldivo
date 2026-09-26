@@ -4,7 +4,8 @@
 voice to your [Pi](https://pi.dev), [OpenCode](https://opencode.ai), and
 [Claude Code](https://claude.com/claude-code) sessions from any browser or
 phone. Speech recognition and speech synthesis run locally on your machine:
-no cloud speech API, no API keys for speech, no extra LLM.
+no cloud speech API, no API keys for speech, no extra LLM. If you run your own
+speech server, you can switch to a bigger or more realistic model instead.
 
 ```bash
 npm i -g meldivo
@@ -37,6 +38,11 @@ Tap any tile to start talking.
   and text-to-speech uses Kokoro v1.0, both running on the CPU through
   [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). Audio never leaves
   your machine unless you turn on phone access.
+- **Or your own speech server.** The hub's "Speech" panel can send either
+  direction to a speech server you run, such as vLLM-Omni (Fish S2 Pro,
+  Voxtral TTS, Qwen3-TTS, Higgs Audio), Kokoro-FastAPI, Chatterbox, Fish
+  Speech, Orpheus, Speaches, vLLM, or whisper.cpp. See
+  [Speech servers](#speech-servers).
 - **Phone and tablet access.** `meldivo remote` (or the hub's "Phone access"
   panel) publishes the hub over HTTPS through Tailscale, a Cloudflare
   tunnel, or your own certificate, and shows a QR code to scan.
@@ -161,6 +167,38 @@ the first reply of each turn skips the model's thinking so it can start
 speaking right away; later steps, after tool calls, think as usual. Hosted
 APIs are never sent this setting.
 
+## Speech servers
+
+By default everything runs on the device. To use a bigger, more realistic,
+or faster model, open the hub page, tap **Speech**, pick an engine for text
+to speech or speech to text, and type its server address. meldivo loads that
+server's models and speakers, and ▶ plays a preview of the selected speaker.
+The choice applies to the whole hub: every machine that joined it and every
+browser that opens it.
+
+| Engine | Direction | Models it serves | Usual address |
+|---|---|---|---|
+| [vLLM-Omni](https://github.com/vllm-project/vllm-omni) | Text to speech | Fish S2 Pro, Voxtral TTS, Qwen3-TTS, Higgs Audio, Breeze TTS 2, CosyVoice, IndexTTS2 | `http://localhost:8091` |
+| [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) | Text to speech | Kokoro | `http://localhost:8880` |
+| [Chatterbox TTS Server](https://github.com/devnen/Chatterbox-TTS-Server) | Text to speech | Chatterbox, Turbo, Multilingual | `http://localhost:8004` |
+| [Fish Speech](https://github.com/fishaudio/fish-speech) | Text to speech | OpenAudio S1, Fish S2 (native API) | `http://localhost:8080` |
+| [Orpheus-FastAPI](https://github.com/Lex-au/Orpheus-FastAPI) | Text to speech | Orpheus | `http://localhost:5005` |
+| [Speaches](https://github.com/speaches-ai/speaches) | Both | Kokoro, Piper; faster-whisper, Parakeet | `http://localhost:8000` |
+| [vLLM](https://docs.vllm.ai) | Speech to text | Whisper, Voxtral, Qwen3-ASR, Granite Speech | `http://localhost:8000` |
+| [whisper.cpp server](https://github.com/ggml-org/whisper.cpp) | Speech to text | Whisper | `http://localhost:8080` |
+| Other OpenAI-compatible | Both | Anything serving `/v1/audio/speech` or `/v1/audio/transcriptions` | |
+
+For example, Kokoro on a GPU:
+
+```sh
+docker run -d --gpus all -p 127.0.0.1:8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:latest
+```
+
+An API key is optional; it is stored on the hub only (in
+`~/.config/meldivo/speech.json`, readable by you alone) and never sent to the
+browser. Audio goes to the server you chose, so pick one you run yourself or
+trust. Speaches downloads a model the first time it is used.
+
 ## Configuration
 
 All settings are optional.
@@ -179,6 +217,7 @@ All settings are optional.
 |---|---|
 | `~/.config/meldivo/secret` | The hub's shared secret, generated automatically. |
 | `~/.config/meldivo/hub.json` | On a machine that joined a hub: the hub's address, this machine's credential, and the hub's pinned key. |
+| `~/.config/meldivo/speech.json` | The speech engines chosen in the hub's "Speech" panel, and their API keys. |
 | `~/.config/meldivo/machines.json`, `hub-key.pem` | On a hub: joined machines (names and credential hashes) and the hub's signing key. |
 | `~/.cache/meldivo/models` | Downloaded speech models. |
 | `~/.local/state/meldivo` | Service logs and runtime state. |
