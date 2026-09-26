@@ -39,9 +39,9 @@ Tap any tile to start talking.
   [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). Audio never leaves
   your machine unless you turn on phone access.
 - **Or your own speech server.** The hub's "Speech" panel can send either
-  direction to a speech server you run, such as vLLM-Omni (Fish S2 Pro,
-  Voxtral TTS, Qwen3-TTS, Higgs Audio), Kokoro-FastAPI, Chatterbox, Fish
-  Speech, Orpheus, Speaches, vLLM, or whisper.cpp. See
+  direction to a speech server you run, such as Breeze TTS 2, vLLM-Omni
+  (Fish S2 Pro, Voxtral TTS, Qwen3-TTS, Higgs Audio), Kokoro-FastAPI,
+  Chatterbox, Fish Speech, Orpheus, Speaches, vLLM, or whisper.cpp. See
   [Speech servers](#speech-servers).
 - **Phone and tablet access.** `meldivo remote` (or the hub's "Phone access"
   panel) publishes the hub over HTTPS through Tailscale, a Cloudflare
@@ -178,7 +178,8 @@ browser that opens it.
 
 | Engine | Direction | Models it serves | Usual address |
 |---|---|---|---|
-| [vLLM-Omni](https://github.com/vllm-project/vllm-omni) | Text to speech | Fish S2 Pro, Voxtral TTS, Qwen3-TTS, Higgs Audio, Breeze TTS 2, CosyVoice, IndexTTS2 | `http://localhost:8091` |
+| [Breeze-TTS-2.cpp](https://github.com/HoppouAI/Breeze-TTS-2.cpp) | Text to speech | Breeze TTS 2, with the voices you saved on the server | `http://localhost:8080` |
+| [vLLM-Omni](https://github.com/vllm-project/vllm-omni) | Text to speech | Fish S2 Pro, Voxtral TTS, Qwen3-TTS, Higgs Audio, CosyVoice, IndexTTS2 | `http://localhost:8091` |
 | [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) | Text to speech | Kokoro | `http://localhost:8880` |
 | [Chatterbox TTS Server](https://github.com/devnen/Chatterbox-TTS-Server) | Text to speech | Chatterbox, Turbo, Multilingual | `http://localhost:8004` |
 | [Fish Speech](https://github.com/fishaudio/fish-speech) | Text to speech | OpenAudio S1, Fish S2 (native API) | `http://localhost:8080` |
@@ -193,6 +194,11 @@ For example, Kokoro on a GPU:
 ```sh
 docker run -d --gpus all -p 127.0.0.1:8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:latest
 ```
+
+Breeze TTS 2 designs a voice from a description or clones one from a short
+clip. Save the voice you like on the Breeze server once (its `POST /v1/voices`
+with a `name`, or `breeze-cli --save-voice`); meldivo lists your saved voices as
+speakers, so every reply uses the same voice.
 
 An API key is optional; it is stored on the hub only (in
 `~/.config/meldivo/speech.json`, readable by you alone) and never sent to the

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { startServer } from "../server/src/index.ts";
-import { discover, fixStreamingWav, normalizeBaseUrl, synthesizeWith, transcribeWith, voiceNames } from "../server/src/speech-api.ts";
+import { discover, fixStreamingWav, normalizeBaseUrl, pcmToWav, synthesizeWith, transcribeWith, voiceNames } from "../server/src/speech-api.ts";
 
 function wav(bytes = 8, dataSize = bytes) {
   const buffer = Buffer.alloc(44 + bytes);
@@ -49,6 +49,12 @@ async function fakeSpeechServer(t, { key } = {}) {
       if (url.pathname === "/v1/registry") return json({ data: [{ id: "istupakov/parakeet-tdt-0.6b-v3-onnx" }] });
       if (url.pathname === "/v1/models") return json({ object: "list", data: [{ id: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" }] });
       if (url.pathname === "/v1/audio/voices") return json({ voices: ["vivian", "ryan"], uploaded_voices: [{ name: "my_voice" }] });
+      if (url.pathname === "/health") return json({ status: "ok", sample_rate: 24000 });
+      if (url.pathname === "/v1/voices") return json([{ id: "narrator_uk", frames: 46, saved: true }]);
+      if (url.pathname === "/breeze/v1/audio/speech") {
+        res.writeHead(200, { "Content-Type": "audio/pcm", "X-Sample-Rate": "24000" });
+        return res.end(Buffer.alloc(480));
+      }
       if (url.pathname === "/v1/references/list") return json({ success: true, reference_ids: ["narrator"] });
       if (url.pathname === "/v1/audio/speech" || url.pathname === "/v1/tts") {
         res.writeHead(200, { "Content-Type": "audio/wav" });
@@ -81,6 +87,14 @@ test("voiceNames reads every voice-list shape", () => {
   assert.deepEqual(voiceNames({ voices: ["ok", "bad voice/../"] }), ["ok"]);
 });
 
+test("pcmToWav wraps raw PCM", () => {
+  const out = pcmToWav(Buffer.alloc(100), 24000);
+  assert.equal(out.toString("ascii", 0, 4), "RIFF");
+  assert.equal(out.readUInt32LE(24), 24000);
+  assert.equal(out.readUInt32LE(40), 100);
+  assert.equal(out.length, 144);
+});
+
 test("fixStreamingWav repairs placeholder sizes", () => {
   const fixed = fixStreamingWav(wav(8, 0xffffffff));
   assert.equal(fixed.readUInt32LE(40), 8);
@@ -98,6 +112,8 @@ test("discover loads models and speakers per engine", async (t) => {
   assert.equal(speaches.model, "speaches-ai/Kokoro-82M-v1.0-ONNX");
   assert.deepEqual(speaches.voices, ["af_heart", "am_adam"]);
   assert.equal(speaches.voice, "af_heart");
+  const breeze = await discover("tts", { engine: "breeze", url });
+  assert.deepEqual(breeze, { models: [], voices: ["narrator_uk"], voice: "narrator_uk" });
   const fish = await discover("tts", { engine: "fish-speech", url });
   assert.deepEqual(fish.voices, ["default", "narrator"]);
   const stt = await discover("stt", { engine: "speaches", url });
@@ -116,6 +132,11 @@ test("synthesize and transcribe speak each server's API and send the key", async
   const sent = JSON.parse(seen.at(-1).body.toString());
   assert.deepEqual(sent, { model: "m", input: "Hello", voice: "vivian", response_format: "wav" });
   assert.equal(seen.at(-1).auth, "Bearer k-123");
+
+  const breezeWav = await synthesizeWith({ engine: "breeze", url: `${url}/breeze`, apiKey: "k-123" }, "Hi", "narrator_uk");
+  assert.equal(breezeWav.toString("ascii", 0, 4), "RIFF");
+  assert.equal(breezeWav.readUInt32LE(40), 480);
+  assert.match(seen.at(-1).body.toString("latin1"), /name="voice_id"\r\n\r\nnarrator_uk/);
 
   await synthesizeWith({ engine: "fish-speech", url, apiKey: "k-123" }, "Hi", "narrator");
   assert.equal(seen.at(-1).url, "/v1/tts");

@@ -22,7 +22,8 @@ export interface EngineInfo {
 
 export const TTS_ENGINES: EngineInfo[] = [
   { id: "local", label: "On this device", note: "Kokoro, no server needed", hasModels: false },
-  { id: "vllm-omni", label: "vLLM-Omni", note: "Fish S2 Pro, Voxtral TTS, Qwen3-TTS, Higgs Audio, Breeze TTS 2, CosyVoice, IndexTTS2", defaultUrl: "http://localhost:8091", hasModels: true },
+  { id: "breeze", label: "Breeze TTS 2", note: "Breeze-TTS-2.cpp server, your saved voices", defaultUrl: "http://localhost:8080", hasModels: false },
+  { id: "vllm-omni", label: "vLLM-Omni", note: "Fish S2 Pro, Voxtral TTS, Qwen3-TTS, Higgs Audio, CosyVoice, IndexTTS2", defaultUrl: "http://localhost:8091", hasModels: true },
   { id: "kokoro-fastapi", label: "Kokoro-FastAPI", note: "Kokoro on a GPU", defaultUrl: "http://localhost:8880", hasModels: false },
   { id: "chatterbox", label: "Chatterbox TTS Server", note: "Chatterbox, Turbo, Multilingual", defaultUrl: "http://localhost:8004", hasModels: false },
   { id: "fish-speech", label: "Fish Speech", note: "OpenAudio S1 and Fish S2 native server", defaultUrl: "http://localhost:8080", hasModels: false },
@@ -335,6 +336,13 @@ async function discoverTts(setting: EngineSetting): Promise<Discovery> {
       await response.body?.cancel();
       return { models: [{ id: "orpheus" }], model: "orpheus", voices: ORPHEUS_VOICES, voice: "tara" };
     }
+    case "breeze": {
+      // Breeze-TTS-2.cpp lists the voices saved with POST /v1/voices; without one, every reply would be a new random voice.
+      await getJson(setting, "/health");
+      const voices = voiceNames(await tryJson(setting, "/v1/voices"));
+      if (!voices.length) throw new Error("This Breeze server has no saved voices yet; save one with POST /v1/voices first");
+      return { models: [], voices, voice: voices[0] };
+    }
     case "fish-speech": {
       const body = await getJson(setting, "/v1/references/list");
       return { models: [], voices: ["default", ...voiceNames(body).filter((v) => v !== "default")], voice: "default" };
@@ -397,6 +405,25 @@ async function readAudio(response: Response): Promise<Buffer> {
   return fixStreamingWav(bytes);
 }
 
+/** Wraps raw 16-bit mono little-endian PCM in a WAV header. */
+export function pcmToWav(pcm: Buffer, sampleRate: number): Buffer {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
 /** Streaming servers write placeholder sizes into the WAV header; browsers such as Safari reject those. */
 export function fixStreamingWav(bytes: Buffer): Buffer {
   if (bytes.length < 12 || bytes.toString("ascii", 0, 4) !== "RIFF" || bytes.toString("ascii", 8, 12) !== "WAVE") return bytes;
@@ -440,6 +467,19 @@ async function withSpeachesInstall(setting: EngineSetting, run: () => Promise<Re
 }
 
 export async function synthesizeWith(setting: EngineSetting, text: string, voice: string | undefined, signal?: AbortSignal): Promise<Buffer> {
+  if (setting.engine === "breeze") {
+    const form = new FormData();
+    form.append("text", text);
+    if (voice) form.append("voice_id", voice);
+    form.append("seed", "42");
+    const response = await request(setting, "/v1/audio/speech", { method: "POST", body: form, timeoutMs: SPEECH_TIMEOUT_MS, signal });
+    if (!response.ok) throw new Error(await describeFailure(response));
+    const audio = await readAudio(response);
+    if (audio.toString("ascii", 0, 4) === "RIFF") return audio;
+    // The server streams raw 16-bit mono PCM and names its rate in a header.
+    const rate = Number(response.headers.get("x-sample-rate")) || 24_000;
+    return pcmToWav(audio, rate);
+  }
   if (setting.engine === "fish-speech") {
     const response = await request(setting, "/v1/tts", {
       method: "POST",
