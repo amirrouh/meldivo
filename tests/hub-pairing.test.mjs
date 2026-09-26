@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { startServer } from "../server/src/index.ts";
 import { joinHub } from "../server/src/machine-client.ts";
+import { voicePrompt } from "../server/src/harnesses/voice-turn.ts";
 
 // A hub and two machines on localhost, set up the way a user would: the hub issues one-time
 // codes, each machine joins with one and then connects out to the hub on its own.
@@ -162,7 +163,8 @@ test("hub mode: machines join with a one-time code, list their sessions, and run
     });
     const events = await readSseUntilDone(response);
     assert.deepEqual(events.map((event) => event.type), ["session", "delta", "done"]);
-    assert.equal(claude.calls.at(-1).text, "secret plans for tuesday");
+    // The machine that runs the turn adds the voice note once; the hub relays the text untouched.
+    assert.equal(claude.calls.at(-1).text, voicePrompt("secret plans for tuesday"));
   });
 
   await t.test("cancel reaches a machine's new chat by its resolved key", async () => {

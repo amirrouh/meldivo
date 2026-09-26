@@ -910,6 +910,32 @@ export default function App({ sessionKey, folder }: AppProps) {
         report("Microphone disconnected. Tap the shape to reconnect.");
       };
       for (const track of activeMicrophone.getAudioTracks()) track.onended = handleMicrophoneEnded;
+      // Safari (especially on iPhone) suspends or "interrupts" the audio context after a
+      // notification sound, Siri, a call, locking the screen, or an audio route change. Speech
+      // detection runs inside it, so without this the page stops hearing while still looking connected.
+      let pausedReported = false;
+      const keepAudioRunning = () => {
+        if (audio.current !== activeContext || !started.current) return;
+        if ((activeContext.state as string) === "running" || activeContext.state === "closed") {
+          pausedReported = false;
+          return;
+        }
+        void activeContext.resume().catch(() => undefined).then(() => {
+          if (audio.current !== activeContext || !started.current || (activeContext.state as string) === "running" || pausedReported) return;
+          pausedReported = true;
+          report("The device paused audio. Tap the shape to keep talking.");
+        });
+      };
+      activeContext.onstatechange = keepAudioRunning;
+      const audioWatch = window.setInterval(() => {
+        if (audio.current !== activeContext || activeContext.state === "closed") {
+          window.clearInterval(audioWatch);
+          document.removeEventListener("visibilitychange", keepAudioRunning);
+          return;
+        }
+        keepAudioRunning();
+      }, 2_000);
+      document.addEventListener("visibilitychange", keepAudioRunning);
       if (!activeMicrophone.getAudioTracks().some((track) => track.readyState === "live")) {
         handleMicrophoneEnded();
         return;
@@ -1001,6 +1027,15 @@ export default function App({ sessionKey, folder }: AppProps) {
     if (!started.current) {
       if (!starting.current) void start();
       return;
+    }
+    // A tap while the device has paused audio resumes listening rather than muting.
+    const context = audio.current;
+    if (context && (context.state as string) !== "running" && context.state !== "closed") {
+      await context.resume().catch(() => undefined);
+      if ((context.state as string) === "running") {
+        updateState(muted.current ? "muted" : "listening");
+        return;
+      }
     }
     muted.current = !muted.current;
     if (muted.current) {

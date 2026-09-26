@@ -17,6 +17,7 @@ import { MACHINE_NAME, parseMachineKey } from "./protocol.js";
 import { detectRemoteOptions, RemoteManager, remoteGuideUrl, type RemoteId } from "./remote.js";
 import { createSherpaEngine, type SpeechEngine } from "./speech.js";
 import { defaultStateDir, SessionStateStore } from "./state.js";
+import { voicePrompt } from "./harnesses/voice-turn.js";
 
 const VOICE_LEASE_TTL_MS = 15_000;
 const SESSIONS_CACHE_MS = 3_000;
@@ -247,7 +248,8 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     };
 
     try {
-      for await (const event of adapter.send(target, message, signal)) {
+      // Every reply is spoken, so every turn asks for a short spoken answer (see voice-turn.ts).
+      for await (const event of adapter.send(target, voicePrompt(message), signal)) {
         if (event.type === "session") sessionId = event.id;
         if (event.type === "delta") sawDelta = true;
 

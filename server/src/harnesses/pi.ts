@@ -2,7 +2,11 @@ import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { HarnessAdapter, SendTarget, SessionInfo, TurnEvent } from "./types.js";
+
+/** Loaded into every turn's pi process: thinking off for the first reply (see pi-voice-extension.ts). */
+const VOICE_EXTENSION = fileURLToPath(new URL(`./pi-voice-extension${path.extname(fileURLToPath(import.meta.url))}`, import.meta.url));
 
 interface PiOptions {
   home?: string;
@@ -267,6 +271,7 @@ export function createPiAdapter(options: PiOptions = {}): HarnessAdapter {
         }
       }
       if (target.model) args.push("--model", target.model);
+      if (existsSync(VOICE_EXTENSION)) args.push("-e", VOICE_EXTENSION);
       args.push(text);
 
       const child = spawn(bin, args, {
@@ -287,6 +292,9 @@ export function createPiAdapter(options: PiOptions = {}): HarnessAdapter {
       let resolveNext: (() => void) | undefined;
       let ended = false;
       let exitCode: number | null = null;
+      // A clean exit with no session id or no reply text means the CLI's output format changed.
+      let sawSession = false;
+      let sawText = false;
 
       child.stdout.on("data", (chunk: Buffer) => {
         buffered += chunk.toString("utf8");
@@ -308,10 +316,12 @@ export function createPiAdapter(options: PiOptions = {}): HarnessAdapter {
       function handleEvent(obj: Record<string, unknown>) {
         const type = obj.type;
         if (type === "session" && typeof obj.id === "string") {
+          sawSession = true;
           events.push({ type: "session", id: obj.id });
         } else if (type === "message_update") {
           const ev = obj.assistantMessageEvent as Record<string, unknown> | undefined;
           if (ev?.type === "text_delta" && typeof ev.delta === "string") {
+            sawText = true;
             events.push({ type: "delta", text: ev.delta });
           }
         } else if (type === "tool_execution_start") {
@@ -353,6 +363,9 @@ export function createPiAdapter(options: PiOptions = {}): HarnessAdapter {
         }
         if (exitCode !== 0 && exitCode !== null) {
           yield { type: "error", message: stderrTail.trim() || `pi exited with code ${exitCode}` };
+        }
+        if (exitCode === 0 && (!sawSession || !sawText)) {
+          yield { type: "notice", message: "pi finished without a reply meldivo could read; this pi version may not be supported yet, so update meldivo" };
         }
       } finally {
         signal.removeEventListener("abort", onAbort);

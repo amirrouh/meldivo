@@ -153,6 +153,14 @@ turn runs against a fork instead, so the terminal session is never touched.
 Your speech is transcribed locally, sent to the agent as a normal user
 message, and the reply is read aloud with local text-to-speech.
 
+Because every reply is spoken, meldivo adds a short note to each message asking
+for a brief, plain answer and a one-sentence heads-up before any tool call, so
+you hear something within seconds even during long tasks. For reasoning models
+served on your own machine or private network (llama.cpp, vLLM, and similar),
+the first reply of each turn skips the model's thinking so it can start
+speaking right away; later steps, after tool calls, think as usual. Hosted
+APIs are never sent this setting.
+
 ## Configuration
 
 All settings are optional.

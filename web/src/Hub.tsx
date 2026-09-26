@@ -149,7 +149,8 @@ function RemotePanel({ onClose }: { onClose: () => void }) {
 }
 
 const selectedMachineKey = "meldivo.machine";
-const pageSize = 40;
+// A folder card gets its own search box once it holds more sessions than this.
+const folderSearchMin = 5;
 
 function hostKeyPrefix(host: HostInfo): string {
   return host.id ? `@${host.id}/` : "";
@@ -212,6 +213,40 @@ function SessionRow({ session }: { session: SessionInfo }) {
   );
 }
 
+function matchesTerms(session: SessionInfo, terms: string[]): boolean {
+  if (terms.length === 0) return true;
+  const haystack = `${session.title} ${shortenCwd(session.cwd)} ${harnessLabel[session.harness]}`.toLowerCase();
+  return terms.every((term) => haystack.includes(term));
+}
+
+function searchTerms(query: string): string[] {
+  return query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+}
+
+/** One folder's sessions: scrolls on its own, with its own search once it holds more than a few. */
+function FolderCard({ cwd, sessions, total }: { cwd: string; sessions: SessionInfo[]; total: number }) {
+  const [query, setQuery] = useState("");
+  const terms = searchTerms(query);
+  const shown = sessions.filter((session) => matchesTerms(session, terms));
+  const short = shortenCwd(cwd);
+  const name = short === "~" ? "Home folder" : short || "(no folder)";
+  return (
+    <section className="hub-folder" aria-label={name}>
+      <h3 className="hub-folder__title">
+        <span>{name}</span>
+        <span className="hub-folder__count">{sessions.length === total ? total : `${sessions.length} of ${total}`}</span>
+      </h3>
+      {sessions.length > folderSearchMin && (
+        <input type="search" className="hub-folder__search" placeholder={`Search in ${name}`} value={query}
+          onChange={(event) => setQuery(event.target.value)} aria-label={`Search sessions in ${name}`} autoComplete="off" />
+      )}
+      {shown.length === 0
+        ? <p className="hub-muted hub-folder__none">No sessions here match.</p>
+        : <ul className="hub-sessions hub-folder__list">{shown.map((session) => <SessionRow key={session.key} session={session} />)}</ul>}
+    </section>
+  );
+}
+
 function NewChat({ host, folders, agent, folder, onClose }: { host: HostInfo; folders: string[]; agent: HarnessId | "all"; folder: string; onClose: () => void }) {
   const available = [...host.harnesses].filter((harness) => harness.available).sort((a, b) => harnessOrder.indexOf(a.id) - harnessOrder.indexOf(b.id));
   const [chosenAgent, setChosenAgent] = useState<HarnessId | undefined>(
@@ -256,11 +291,9 @@ function MachinePanel({ host, sessions }: { host: HostInfo; sessions: SessionInf
   const [order, setOrder] = useState<SortOrder>("newest");
   const [openOnly, setOpenOnly] = useState(false);
   const [newChatOpen, setNewChatOpen] = useState(false);
-  const [limit, setLimit] = useState(pageSize);
   useEffect(() => {
-    setQuery(""); setAgent("all"); setFolder("all"); setRange("any"); setOrder("newest"); setOpenOnly(false); setNewChatOpen(false); setLimit(pageSize);
+    setQuery(""); setAgent("all"); setFolder("all"); setRange("any"); setOrder("newest"); setOpenOnly(false); setNewChatOpen(false);
   }, [host.id]);
-  useEffect(() => setLimit(pageSize), [query, agent, folder, range, order, openOnly]);
 
   if (!host.online) {
     return <p className="hub-empty">{host.name} is offline. Its sessions appear here as soon as it reconnects.</p>;
@@ -273,33 +306,32 @@ function MachinePanel({ host, sessions }: { host: HostInfo; sessions: SessionInf
   const newChatFolders = folders.filter((cwd) => cwd && shortenCwd(cwd) !== "~");
 
   const agents = harnessOrder.filter((id) => sessions.some((session) => session.harness === id));
-  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const terms = searchTerms(query);
   const matches = sortSessions(sessions.filter((session) => {
     if (agent !== "all" && session.harness !== agent) return false;
     if (folder !== "all" && session.cwd !== folder) return false;
     if (openOnly && !session.open) return false;
     if (!inRange(session.updatedAt, range)) return false;
-    if (terms.length === 0) return true;
-    const haystack = `${session.title} ${shortenCwd(session.cwd)} ${harnessLabel[session.harness]}`.toLowerCase();
-    return terms.every((term) => haystack.includes(term));
+    return matchesTerms(session, terms);
   }), order);
   const openCount = sessions.filter((session) => session.open).length;
   const filtered = agent !== "all" || folder !== "all" || range !== "any" || openOnly || terms.length > 0;
 
-  // Group the visible page by folder, keeping the chosen order inside and across groups.
-  const visible = matches.slice(0, limit);
+  // One card per folder, keeping the chosen order inside and across cards.
   const groups: { cwd: string; sessions: SessionInfo[] }[] = [];
-  for (const session of visible) {
-    const group = folder === "all" ? groups.find((entry) => entry.cwd === session.cwd) : groups[0];
+  for (const session of matches) {
+    const group = groups.find((entry) => entry.cwd === session.cwd);
     if (group) group.sessions.push(session);
     else groups.push({ cwd: session.cwd, sessions: [session] });
   }
+  const folderTotals = new Map<string, number>();
+  for (const session of sessions) folderTotals.set(session.cwd, (folderTotals.get(session.cwd) ?? 0) + 1);
 
   return (
     <div className="hub-panel" role="tabpanel">
       <div className="hub-search">
-        <input type="search" className="hub-search__input" placeholder={`Search ${sessions.length} sessions`} value={query}
-          onChange={(event) => setQuery(event.target.value)} aria-label="Search sessions" autoComplete="off" />
+        <input type="search" className="hub-search__input" placeholder={`Search all ${sessions.length} sessions`} value={query}
+          onChange={(event) => setQuery(event.target.value)} aria-label={`Search all sessions on ${host.name}`} autoComplete="off" />
         <button type="button" className="hub-primary" aria-expanded={newChatOpen} onClick={() => setNewChatOpen(!newChatOpen)}>
           {newChatOpen ? "Close" : "New chat"}
         </button>
@@ -351,22 +383,11 @@ function MachinePanel({ host, sessions }: { host: HostInfo; sessions: SessionInf
       )}
       {filtered && matches.length > 0 && <p className="hub-count">{matches.length} of {sessions.length} sessions</p>}
 
-      {groups.map((group) => (
-        <section key={group.cwd} className="hub-folder">
-          <h3 className="hub-folder__title">
-            <span>{shortenCwd(group.cwd) || "(no folder)"}</span>
-            <span className="hub-folder__count">{matches.filter((session) => session.cwd === group.cwd).length}</span>
-          </h3>
-          <ul className="hub-sessions">
-            {group.sessions.map((session) => <SessionRow key={session.key} session={session} />)}
-          </ul>
-        </section>
-      ))}
-      {matches.length > limit && (
-        <button type="button" className="hub-more" onClick={() => setLimit(limit + pageSize)}>
-          Show more ({matches.length - limit})
-        </button>
-      )}
+      <div className="hub-folders">
+        {groups.map((group) => (
+          <FolderCard key={`${host.id}|${group.cwd}`} cwd={group.cwd} sessions={group.sessions} total={folderTotals.get(group.cwd) ?? group.sessions.length} />
+        ))}
+      </div>
     </div>
   );
 }

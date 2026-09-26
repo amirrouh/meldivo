@@ -1,9 +1,10 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { readFileSync, readdirSync, readlinkSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, readlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Readable } from "node:stream";
 import type { HarnessAdapter, SendTarget, SessionInfo, TurnEvent } from "./types.js";
 
@@ -129,6 +130,8 @@ interface WarmServer {
   port: number;
   password: string;
   baseUrl: string;
+  /** Events this adapter relies on that the running OpenCode no longer documents. */
+  missingEvents?: string[];
 }
 
 const READY_RE = /listening on http:\/\/[^:]+:(\d+)/i;
@@ -155,6 +158,52 @@ function authHeader(password: string): string {
   return `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
 }
 
+// Server events a turn depends on; each entry lists accepted names across OpenCode versions.
+// If OpenCode renames one, turns can silently hang (e.g. an unanswered permission prompt), so the
+// adapter checks the server's own API description once at startup and warns instead.
+const REQUIRED_EVENTS = [
+  ["permission.asked", "permission.updated"],
+  ["session.idle"],
+  ["session.error"],
+  ["message.part.delta"],
+  ["message.part.updated"],
+];
+
+/** Names from REQUIRED_EVENTS missing from the server's OpenAPI document, or [] if it can't tell. */
+export async function checkEventContract(baseUrl: string, password: string): Promise<string[]> {
+  try {
+    const res = await fetch(`${baseUrl}/doc`, { headers: { authorization: authHeader(password) }, signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return [];
+    const doc = await res.text();
+    if (!doc.includes('"openapi"')) return [];
+    return REQUIRED_EVENTS.filter((names) => !names.some((name) => doc.includes(`"${name}"`))).map((names) => names.join(" or "));
+  } catch {
+    return [];
+  }
+}
+
+const VOICE_PLUGIN = new URL(`./opencode-voice-plugin${path.extname(fileURLToPath(import.meta.url))}`, import.meta.url);
+
+/**
+ * Adds meldivo's voice plugin (thinking off for a voice turn's first reply) to the extra config
+ * OpenCode merges over the user's own; it only applies to the server meldivo starts.
+ */
+export function withVoicePlugin(existing: string | undefined): string | undefined {
+  if (!existsSync(fileURLToPath(VOICE_PLUGIN))) return existing;
+  let config: Record<string, unknown> = {};
+  if (existing) {
+    try {
+      const parsed = JSON.parse(existing) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return existing;
+      config = parsed as Record<string, unknown>;
+    } catch {
+      return existing;
+    }
+  }
+  const plugins = Array.isArray(config.plugin) ? config.plugin : [];
+  return JSON.stringify({ ...config, plugin: [...plugins, VOICE_PLUGIN.href] });
+}
+
 /** Lazily starts (or reuses) a warm `opencode serve` process for this adapter instance. */
 function createWarmServerManager(bin: string) {
   let current: WarmServer | undefined;
@@ -164,7 +213,7 @@ function createWarmServerManager(bin: string) {
     const password = randomBytes(24).toString("hex");
     const child = spawn(bin, ["serve", "--hostname", "127.0.0.1", "--port", "0"], {
       cwd: tmpdir(),
-      env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
+      env: { ...process.env, OPENCODE_SERVER_PASSWORD: password, OPENCODE_CONFIG_CONTENT: withVoicePlugin(process.env.OPENCODE_CONFIG_CONTENT) },
       stdio: ["ignore", "pipe", "pipe"],
     }) as ChildProcessByStdio<null, Readable, Readable>;
     warmChildrenToKill.add(child);
@@ -220,7 +269,11 @@ function createWarmServerManager(bin: string) {
       if (current && current.child.exitCode === null) return current;
       if (!starting) {
         starting = spawnServer()
-          .then((server) => {
+          .then(async (server) => {
+            server.missingEvents = await checkEventContract(server.baseUrl, server.password);
+            if (server.missingEvents.length) {
+              console.warn(JSON.stringify({ timestamp: new Date().toISOString(), level: "warn", event: "opencode_api_mismatch", missing: server.missingEvents }));
+            }
             current = server;
             return server;
           })
@@ -237,7 +290,7 @@ export function createOpenCodeAdapter(options: OpenCodeOptions = {}): HarnessAda
   const home = options.home ?? homedir();
   const bin = options.bin ?? "opencode";
   const dbPath = path.join(home, ".local", "share", "opencode", "opencode.db");
-  const warmServer: { ensure(): Promise<{ baseUrl: string; password: string }> } = options.testServer
+  const warmServer: { ensure(): Promise<{ baseUrl: string; password: string; missingEvents?: string[] }> } = options.testServer
     ? { ensure: async () => options.testServer! }
     : createWarmServerManager(bin);
 
@@ -328,7 +381,7 @@ export function createOpenCodeAdapter(options: OpenCodeOptions = {}): HarnessAda
         return;
       }
 
-      let server: { baseUrl: string; password: string };
+      let server: { baseUrl: string; password: string; missingEvents?: string[] };
       try {
         server = await warmServer.ensure();
       } catch (err) {
@@ -337,6 +390,9 @@ export function createOpenCodeAdapter(options: OpenCodeOptions = {}): HarnessAda
         return;
       }
 
+      if (server.missingEvents?.length) {
+        yield { type: "notice", message: `this OpenCode version may not be fully supported by meldivo (missing ${server.missingEvents.join(", ")}); update meldivo if the turn hangs` };
+      }
       yield* sendViaWarmServer(server, target, text, signal);
     },
   };
@@ -353,6 +409,8 @@ async function* sendViaHttp(
   const events: TurnEvent[] = [{ type: "session", id: sessionId }];
   let resolveNext: (() => void) | undefined;
   let done = false;
+  // True once the run itself ended (idle, error, or never started), unlike `done`, which a closed stream also sets.
+  let finished = false;
   let errored: string | undefined;
 
   const partMessage = new Map<string, string>();
@@ -415,7 +473,7 @@ async function* sendViaHttp(
       const info = props?.info as Record<string, unknown> | undefined;
       const idleSessionId = props?.sessionID ?? info?.id;
       if (idleSessionId === sessionId) {
-        done = true;
+        done = finished = true;
       }
     }
     resolveNext?.();
@@ -430,11 +488,11 @@ async function* sendViaHttp(
     });
     if (!res.ok) {
       events.push({ type: "error", message: `failed to send prompt (${res.status})` });
-      done = true;
+      done = finished = true;
     }
   } catch (err) {
     events.push({ type: "error", message: String(err) });
-    done = true;
+    done = finished = true;
   }
 
   try {
@@ -451,8 +509,21 @@ async function* sendViaHttp(
   } finally {
     signal.removeEventListener("abort", onAbort);
     controller.abort();
+    if (signal.aborted && !finished) await stopRun(`${base}/session/${sessionId}/abort`, {});
     await streamPromise;
     yield { type: "done" };
+  }
+}
+
+/**
+ * Closing the event stream doesn't stop OpenCode: the run keeps going server-side and the next
+ * prompt to the session queues behind it. So a cancelled turn also aborts the run itself.
+ */
+async function stopRun(url: string, headers: Record<string, string>): Promise<void> {
+  try {
+    await fetch(url, { method: "POST", headers, signal: AbortSignal.timeout(3000) });
+  } catch {
+    // best effort; the run then finishes on its own
   }
 }
 
@@ -483,6 +554,8 @@ async function* sendViaWarmServer(
   const events: TurnEvent[] = [];
   let resolveNext: (() => void) | undefined;
   let done = false;
+  // True once the run itself ended (idle, error, or never started), unlike `done`, which a closed stream also sets.
+  let finished = false;
   let errored: string | undefined;
 
   const controller = new AbortController();
@@ -531,6 +604,8 @@ async function* sendViaWarmServer(
   const roleByMessageId = new Map<string, string>();
   const partTypeByPartId = new Map<string, string>();
   const toolEventsEmitted = new Set<string>();
+  // The turn's session plus any subagent sessions it spawns: they block the turn on prompts too.
+  const family = new Set<string>([sessionId]);
 
   const streamPromise = (async () => {
     try {
@@ -611,19 +686,55 @@ async function* sendViaWarmServer(
       return;
     }
 
-    if (type === "permission.updated") {
-      if (props.sessionID !== sessionId) return;
+    if (type === "session.created" || type === "session.updated") {
+      const info = props.info as Record<string, unknown> | undefined;
+      if (info && typeof info.id === "string" && typeof info.parentID === "string" && family.has(info.parentID)) {
+        family.add(info.id);
+      }
+      return;
+    }
+
+    // No one can answer a prompt during a headless turn, so reject it instead of hanging forever.
+    // "permission.asked" is OpenCode 1.x; "permission.updated" is the older name.
+    if (type === "permission.asked" || type === "permission.updated") {
+      const askedIn = props.sessionID;
       const permissionId = props.id;
-      if (typeof permissionId !== "string") return;
-      const title = typeof props.title === "string" ? props.title : "a tool";
+      if (typeof askedIn !== "string" || !family.has(askedIn) || typeof permissionId !== "string") return;
+      const title = typeof props.permission === "string" ? props.permission : typeof props.title === "string" ? props.title : "a tool";
       push({ type: "notice", message: `a permission request (${title}) was auto-rejected because no one could approve it` });
-      fetch(`${baseUrl}/session/${sessionId}/permissions/${permissionId}?${dirQuery}`, {
+      const legacy = () =>
+        fetch(`${baseUrl}/session/${askedIn}/permissions/${permissionId}?${dirQuery}`, {
+          method: "POST",
+          headers: jsonHeaders,
+          body: JSON.stringify({ response: "reject" }),
+          signal: controller.signal,
+        });
+      const reply =
+        type === "permission.asked"
+          ? fetch(`${baseUrl}/permission/${permissionId}/reply?${dirQuery}`, {
+              method: "POST",
+              headers: jsonHeaders,
+              body: JSON.stringify({ reply: "reject" }),
+              signal: controller.signal,
+            }).then((res) => (res.ok ? res : legacy()))
+          : legacy();
+      reply.catch(() => {
+        // best effort; the session will otherwise stay blocked on this permission
+      });
+      return;
+    }
+
+    if (type === "question.asked") {
+      const askedIn = props.sessionID;
+      const questionId = props.id;
+      if (typeof askedIn !== "string" || !family.has(askedIn) || typeof questionId !== "string") return;
+      push({ type: "notice", message: "the agent asked a question that was dismissed because no one could answer it" });
+      fetch(`${baseUrl}/question/${questionId}/reject?${dirQuery}`, {
         method: "POST",
         headers: jsonHeaders,
-        body: JSON.stringify({ response: "reject" }),
         signal: controller.signal,
       }).catch(() => {
-        // best effort; the session will otherwise stay blocked on this permission
+        // best effort; the session will otherwise stay blocked on this question
       });
       return;
     }
@@ -634,13 +745,13 @@ async function* sendViaWarmServer(
       const error = props.error as { data?: { message?: unknown } } | undefined;
       const message = typeof error?.data?.message === "string" ? error.data.message : "opencode reported an error";
       push({ type: "error", message });
-      done = true;
+      done = finished = true;
       resolveNext?.();
       return;
     }
 
     if (type === "session.idle") {
-      if (props.sessionID === sessionId) done = true;
+      if (props.sessionID === sessionId) done = finished = true;
       resolveNext?.();
     }
   }
@@ -657,11 +768,11 @@ async function* sendViaWarmServer(
     });
     if (!res.ok) {
       push({ type: "error", message: `failed to send prompt (${res.status})` });
-      done = true;
+      done = finished = true;
     }
   } catch (err) {
     push({ type: "error", message: err instanceof Error ? err.message : String(err) });
-    done = true;
+    done = finished = true;
   }
 
   try {
@@ -681,6 +792,7 @@ async function* sendViaWarmServer(
   } finally {
     signal.removeEventListener("abort", onAbort);
     controller.abort();
+    if (signal.aborted && !finished) await stopRun(`${baseUrl}/session/${sessionId}/abort?${dirQuery}`, headers);
     await streamPromise;
     yield { type: "done" };
   }

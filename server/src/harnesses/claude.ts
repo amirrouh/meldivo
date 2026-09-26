@@ -331,6 +331,9 @@ export function createClaudeAdapter(options: ClaudeOptions = {}): HarnessAdapter
       let resolveNext: (() => void) | undefined;
       let ended = false;
       let exitCode: number | null = null;
+      // A clean exit with no session id or no reply text means the CLI's output format changed.
+      let sawSession = false;
+      let sawText = false;
       let sessionEmitted = false;
 
       rl.on("line", (line) => {
@@ -346,6 +349,7 @@ export function createClaudeAdapter(options: ClaudeOptions = {}): HarnessAdapter
         if (type === "system" && typeof obj.session_id === "string") {
           if (!sessionEmitted) {
             sessionEmitted = true;
+            sawSession = true;
             events.push({ type: "session", id: obj.session_id });
           }
         } else if (type === "stream_event") {
@@ -353,6 +357,7 @@ export function createClaudeAdapter(options: ClaudeOptions = {}): HarnessAdapter
           if (event?.type === "content_block_delta") {
             const delta = event.delta as Record<string, unknown> | undefined;
             if (delta?.type === "text_delta" && typeof delta.text === "string") {
+              sawText = true;
               events.push({ type: "delta", text: delta.text });
             }
           }
@@ -375,6 +380,7 @@ export function createClaudeAdapter(options: ClaudeOptions = {}): HarnessAdapter
           if (obj.is_error) {
             const msg = typeof obj.result === "string" ? obj.result : "claude reported an error";
             events.push({ type: "error", message: msg });
+            sawText = true; // already reported; don't also claim the format changed
           }
         }
         resolveNext?.();
@@ -412,6 +418,9 @@ export function createClaudeAdapter(options: ClaudeOptions = {}): HarnessAdapter
         }
         if (exitCode !== 0 && exitCode !== null) {
           yield { type: "error", message: stderrTail.trim() || `claude exited with code ${exitCode}` };
+        }
+        if (exitCode === 0 && (!sawSession || !sawText)) {
+          yield { type: "notice", message: "Claude Code finished without a reply meldivo could read; this Claude Code version may not be supported yet, so update meldivo" };
         }
       } finally {
         signal.removeEventListener("abort", onAbort);

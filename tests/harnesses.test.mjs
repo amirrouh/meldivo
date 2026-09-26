@@ -11,7 +11,8 @@ import {
   createPiAdapter,
   listAllSessions,
 } from "../server/src/harnesses/index.ts";
-import { _killAllWarmOpenCodeServersForTests } from "../server/src/harnesses/opencode.ts";
+import { _killAllWarmOpenCodeServersForTests, checkEventContract } from "../server/src/harnesses/opencode.ts";
+import http from "node:http";
 
 const FIXTURES = path.join(import.meta.dirname, "fixtures", "harnesses");
 const tmpDirs = [];
@@ -172,6 +173,19 @@ for (const l of lines) process.stdout.write(JSON.stringify(l) + "\\n");
   assert.ok(types.includes("notice"));
   assert.ok(types.includes("error"));
   assert.equal(types.at(-1), "done");
+});
+
+test("claude and pi send(): a clean exit in an unrecognized output format says so instead of going silent", async () => {
+  const home = makeTmpHome("format-changed-");
+  const body = `process.stdout.write(JSON.stringify({ type: "renamed_event", text: "hello" }) + "\\n");`;
+  for (const adapter of [
+    createClaudeAdapter({ home, bin: writeFakeCli(home, "fake-claude-new", body) }),
+    createPiAdapter({ home, bin: writeFakeCli(home, "fake-pi-new", body) }),
+  ]) {
+    const events = await collect(adapter.send({ id: null, cwd: home, fork: false }, "hi", new AbortController().signal));
+    assert.deepEqual(events.map((e) => e.type), ["notice", "done"]);
+    assert.match(events[0].message, /may not be supported yet/);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -412,6 +426,17 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    const reply = /^\\/(permission|question)\\/([^/]+)\\/(reply|reject)$/.exec(parsed.pathname);
+    if (reply && req.method === "POST") {
+      const body = await readBody(req);
+      if (permissionLogFile) {
+        fs.appendFileSync(permissionLogFile, JSON.stringify({ kind: reply[1], permissionId: reply[2], action: reply[3], body }) + "\\n");
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("true");
+      return;
+    }
+
     if (parsed.pathname.indexOf("/session/") === 0) {
       const rest = parsed.pathname.slice("/session/".length);
       const segments = rest.split("/");
@@ -430,6 +455,13 @@ const server = http.createServer((req, res) => {
         res.writeHead(204);
         res.end();
         sendEventsFor(sessionId);
+        return;
+      }
+
+      if (segments.length === 2 && segments[1] === "abort" && req.method === "POST") {
+        if (permissionLogFile) fs.appendFileSync(permissionLogFile, JSON.stringify({ kind: "abort", sessionId: segments[0] }) + "\\n");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("true");
         return;
       }
 
@@ -531,6 +563,96 @@ test("opencode send(): new session streams assistant text, a tool event, and aut
     delete process.env.OPENCODE_TEST_CONFIG;
     delete process.env.PROMPT_LOG_FILE;
     delete process.env.PERMISSION_LOG_FILE;
+  }
+});
+
+test("opencode send(): rejects permission and question prompts from a subagent session (OpenCode 1.x events)", async () => {
+  const home = makeTmpHome("opencode-subagent-ask-");
+  const permissionLogFile = path.join(home, "permissions.ndjson");
+  const config = {
+    createId: "ses-parent",
+    eventsBySession: {
+      "ses-parent": [
+        { type: "session.created", properties: { sessionID: "ses-child", info: { id: "ses-child", parentID: "ses-parent" } } },
+        { type: "permission.asked", properties: { id: "per-other", sessionID: "ses-unrelated", permission: "bash", patterns: [], metadata: {}, always: [] } },
+        { type: "permission.asked", properties: { id: "per-child", sessionID: "ses-child", permission: "external_directory", patterns: ["/tmp/*"], metadata: {}, always: [] } },
+        { type: "question.asked", properties: { id: "que-child", sessionID: "ses-child", questions: [] } },
+        { type: "session.idle", properties: { sessionID: "ses-parent" } },
+      ],
+    },
+  };
+
+  const adapter = createOpenCodeAdapter({ home, bin: writeFakeOpenCodeServer(home) });
+  process.env.OPENCODE_TEST_CONFIG = JSON.stringify(config);
+  process.env.PERMISSION_LOG_FILE = permissionLogFile;
+  try {
+    const events = await collect(
+      adapter.send({ id: null, cwd: "/tmp/opencode-subagent-fixture", fork: false }, "hi", new AbortController().signal),
+    );
+    assert.deepEqual(events.map((e) => e.type), ["session", "notice", "notice", "done"]);
+    assert.match(events[1].message, /external_directory.*auto-rejected/);
+    await new Promise((r) => setTimeout(r, 100));
+    const calls = readNdjson(permissionLogFile);
+    assert.deepEqual(
+      calls.map((c) => [c.kind, c.permissionId, c.action, c.body.reply]).sort(),
+      [["permission", "per-child", "reply", "reject"], ["question", "que-child", "reject", undefined]],
+    );
+  } finally {
+    delete process.env.OPENCODE_TEST_CONFIG;
+    delete process.env.PERMISSION_LOG_FILE;
+  }
+});
+
+test("opencode send(): cancelling a turn aborts the run in OpenCode, finishing one does not", async () => {
+  const home = makeTmpHome("opencode-abort-");
+  const logFile = path.join(home, "calls.ndjson");
+  const bin = writeFakeOpenCodeServer(home);
+  process.env.PERMISSION_LOG_FILE = logFile;
+  try {
+    // Finishes normally: no abort. (Each adapter starts its own fake server with the current config.)
+    process.env.OPENCODE_TEST_CONFIG = JSON.stringify({ createId: "ses-done", eventsBySession: { "ses-done": [{ type: "session.idle", properties: { sessionID: "ses-done" } }] } });
+    await collect(createOpenCodeAdapter({ home, bin }).send({ id: null, cwd: "/tmp/opencode-abort-fixture", fork: false }, "hi", new AbortController().signal));
+    // Still running when the listener cancels: the run is aborted.
+    process.env.OPENCODE_TEST_CONFIG = JSON.stringify({ createId: "ses-slow", eventsBySession: {} });
+    const controller = new AbortController();
+    const events = [];
+    for await (const event of createOpenCodeAdapter({ home, bin }).send({ id: null, cwd: "/tmp/opencode-abort-fixture", fork: false }, "hi", controller.signal)) {
+      events.push(event.type);
+      if (event.type === "session") controller.abort();
+    }
+    assert.deepEqual(events, ["session", "done"]);
+    assert.deepEqual(readNdjson(logFile).filter((c) => c.kind === "abort").map((c) => c.sessionId), ["ses-slow"]);
+  } finally {
+    delete process.env.OPENCODE_TEST_CONFIG;
+    delete process.env.PERMISSION_LOG_FILE;
+  }
+});
+
+test("opencode checkEventContract(): reports events missing from the server's API description", async () => {
+  const docs = [
+    JSON.stringify({ openapi: "3.1.0", events: ["permission.asked", "session.idle", "session.error", "message.part.delta", "message.part.updated"] }),
+    JSON.stringify({ openapi: "3.1.0", events: ["permission.v3.asked", "session.idle", "session.error", "message.part.delta", "message.part.updated"] }),
+    "not a spec",
+  ];
+  let next = 0;
+  const server = http.createServer((req, res) => {
+    if (req.headers.authorization !== "Basic " + Buffer.from("opencode:pw").toString("base64")) {
+      res.writeHead(401);
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(docs[next++]);
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    assert.deepEqual(await checkEventContract(base, "pw"), []);
+    assert.deepEqual(await checkEventContract(base, "pw"), ["permission.asked or permission.updated"]);
+    assert.deepEqual(await checkEventContract(base, "pw"), []);
+    assert.deepEqual(await checkEventContract(base, "wrong"), []);
+  } finally {
+    server.close();
   }
 });
 
