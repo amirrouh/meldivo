@@ -103,6 +103,8 @@ test("discover loads models and speakers per engine", async (t) => {
   const stt = await discover("stt", { engine: "speaches", url });
   assert.deepEqual(stt.models, [{ id: "Systran/faster-whisper-small" }, { id: "istupakov/parakeet-tdt-0.6b-v3-onnx", installed: false }]);
   assert.equal(stt.model, "Systran/faster-whisper-small");
+  // The vLLM-Omni server only serves a TTS model, so it is refused for speech to text.
+  await assert.rejects(discover("stt", { engine: "vllm", url }), /only has text-to-speech models/);
   const local = await discover("tts", { engine: "local" });
   assert.ok(local.voices.includes("af_heart"));
 });

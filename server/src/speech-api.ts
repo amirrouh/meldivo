@@ -49,6 +49,10 @@ const SPEACHES_STT_PICKS = [
   "Systran/faster-distil-whisper-small.en", // lightest, English only
 ];
 
+// Model ids that give away which direction a model serves, so a server of the wrong kind is caught.
+const TTS_MODEL = /tts|kokoro|piper|orpheus|chatterbox|cosyvoice|higgs|s2-pro|openaudio|breeze|vibevoice|zonos|dia\b|csm/i;
+const STT_MODEL = /whisper|asr|parakeet|canary|granite-speech|transcri|stt|voxtral-mini|speech-to-text/i;
+
 const ORPHEUS_VOICES = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"];
 const OPENAI_VOICES = ["alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar"];
 
@@ -312,6 +316,9 @@ async function discoverTts(setting: EngineSetting): Promise<Discovery> {
     }
     case "vllm-omni": {
       const models = modelIds(await getJson(setting, "/v1/models")).map((m) => ({ id: m.id }));
+      if (models.length && models.every((m) => STT_MODEL.test(m.id) && !TTS_MODEL.test(m.id))) {
+        throw new Error("This server only has speech-to-text models; use it under Speech to text");
+      }
       const voices = voiceNames(await getJson(setting, "/v1/audio/voices"));
       return { models, model: models[0]?.id, voices, voice: voices[0] };
     }
@@ -333,12 +340,13 @@ async function discoverTts(setting: EngineSetting): Promise<Discovery> {
       return { models: [], voices: ["default", ...voiceNames(body).filter((v) => v !== "default")], voice: "default" };
     }
     default: {
-      const models = modelIds(await getJson(setting, "/v1/models")).map((m) => ({ id: m.id }));
-      const speechModels = models.filter((m) => /tts|speech|voice|kokoro|audio/i.test(m.id));
+      const all = modelIds(await getJson(setting, "/v1/models")).map((m) => ({ id: m.id }));
+      const models = all.filter((m) => TTS_MODEL.test(m.id) || !STT_MODEL.test(m.id));
+      if (all.length && !models.length) throw new Error("This server only has speech-to-text models; use it under Speech to text");
       const listed = voiceNames(await tryJson(setting, "/v1/audio/voices"));
       const voices = listed.length ? listed : OPENAI_VOICES;
-      const model = (speechModels[0] ?? models[0])?.id;
-      return { models: speechModels.length ? speechModels : models, model, voices, voice: voices[0] };
+      const model = (models.find((m) => TTS_MODEL.test(m.id)) ?? models[0])?.id;
+      return { models, model, voices, voice: voices[0] };
     }
   }
 }
@@ -366,10 +374,12 @@ async function discoverStt(setting: EngineSetting): Promise<Discovery> {
       return { models, model: installed[0]?.id ?? models[0]?.id, voices: [] };
     }
     default: {
-      const models = modelIds(await getJson(setting, "/v1/models")).map((m) => ({ id: m.id }));
-      const speech = models.filter((m) => /whisper|voxtral|asr|parakeet|canary|granite-speech|transcribe|stt/i.test(m.id));
-      const list = speech.length ? speech : models;
-      return { models: list, model: list[0]?.id, voices: [] };
+      const all = modelIds(await getJson(setting, "/v1/models")).map((m) => ({ id: m.id }));
+      const models = all.filter((m) => !TTS_MODEL.test(m.id) || STT_MODEL.test(m.id));
+      if (!models.length) {
+        throw new Error(all.length ? "This server only has text-to-speech models; use it under Text to speech" : "This server lists no models");
+      }
+      return { models, model: (models.find((m) => STT_MODEL.test(m.id)) ?? models[0])?.id, voices: [] };
     }
   }
 }
