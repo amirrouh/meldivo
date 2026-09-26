@@ -110,10 +110,14 @@ function parseSessionFile(file: string): ParsedSession | undefined {
   };
 }
 
+// Headless `pi` processes this server started for voice turns; never mistaken for a terminal.
+const spawnedPids = new Set<number>();
+
 function readCmdline(pid: string): string[] {
   try {
     const raw = readFileSync(`/proc/${pid}/cmdline`, "utf8");
-    return raw.split("\0").filter((v) => v.length > 0);
+    // A running pi renames its process to "pi" padded with spaces, which drops the path and arguments.
+    return raw.split("\0").map((v) => v.trim()).filter((v) => v.length > 0);
   } catch {
     return [];
   }
@@ -132,6 +136,13 @@ interface OpenPiProcess {
   sessionArg?: string;
 }
 
+/** Whether a process command line is a `pi` CLI, including the bare "pi" title a running pi sets. */
+export function isPiCommand(args: string[]): boolean {
+  const isNode = /node$/.test(args[0] ?? "");
+  const scriptArg = isNode ? args[1] : args[0];
+  return Boolean(scriptArg && /(^|\/)(pi|pi-coding-agent)$/.test(scriptArg));
+}
+
 /** Finds running `pi` interactive/attached processes (not headless one-shot turns we spawned). */
 function findOpenPiProcesses(): OpenPiProcess[] {
   const results: OpenPiProcess[] = [];
@@ -144,9 +155,8 @@ function findOpenPiProcesses(): OpenPiProcess[] {
   for (const pid of pids) {
     const args = readCmdline(pid);
     if (args.length === 0) continue;
-    const isNode = /node$/.test(args[0] ?? "");
-    const scriptArg = isNode ? args[1] : args[0];
-    if (!scriptArg || !/\/(pi|pi-coding-agent)$/.test(scriptArg)) continue;
+    if (!isPiCommand(args)) continue;
+    if (spawnedPids.has(Number(pid))) continue;
     if (args.includes("--mode")) {
       const modeIdx = args.indexOf("--mode");
       const mode = args[modeIdx + 1];
@@ -280,6 +290,11 @@ export function createPiAdapter(options: PiOptions = {}): HarnessAdapter {
         stdio: ["ignore", "pipe", "pipe"],
       });
 
+      if (child.pid) {
+        const pid = child.pid;
+        spawnedPids.add(pid);
+        child.once("exit", () => spawnedPids.delete(pid));
+      }
       const onAbort = () => child.kill("SIGTERM");
       signal.addEventListener("abort", onAbort, { once: true });
 

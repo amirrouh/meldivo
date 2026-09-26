@@ -12,6 +12,7 @@ import {
   listAllSessions,
 } from "../server/src/harnesses/index.ts";
 import { _killAllWarmOpenCodeServersForTests, checkEventContract } from "../server/src/harnesses/opencode.ts";
+import { isPiCommand } from "../server/src/harnesses/pi.ts";
 import http from "node:http";
 
 const FIXTURES = path.join(import.meta.dirname, "fixtures", "harnesses");
@@ -767,4 +768,12 @@ test("listAllSessions: merges and sorts by updatedAt across adapters, honoring l
 
   const limited = await listAllSessions(adapters, 2);
   assert.equal(limited.length, 2);
+});
+
+test("pi: a running pi that renamed its process to a bare title still counts as open", () => {
+  assert.equal(isPiCommand(["pi"]), true);
+  assert.equal(isPiCommand(["/usr/local/bin/node", "/opt/tools/bin/pi", "--session", "x"]), true);
+  assert.equal(isPiCommand(["/opt/tools/bin/pi-coding-agent"]), true);
+  assert.equal(isPiCommand(["pip", "install"]), false);
+  assert.equal(isPiCommand(["/usr/bin/python3", "api.py"]), false);
 });
