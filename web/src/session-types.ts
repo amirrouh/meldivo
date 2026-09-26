@@ -48,7 +48,7 @@ export function splitHostKey(key: string): { prefix: string; host: string; inner
 export type TurnEvent =
   | { type: "session"; id: string }
   | { type: "status"; message: string }
-  | { type: "tool"; name: string }
+  | { type: "tool"; name: string; summary?: string; detail?: string; folder?: string }
   | { type: "delta"; text: string }
   | { type: "notice"; message: string }
   | { type: "error"; message: string }

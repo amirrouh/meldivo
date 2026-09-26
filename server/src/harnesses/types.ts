@@ -22,7 +22,8 @@ export interface SessionInfo {
 export type TurnEvent =
   | { type: "session"; id: string } // id of the session the turn actually ran in (differs after a fork or for a new session)
   | { type: "status"; message: string }
-  | { type: "tool"; name: string }
+  // summary is plain language from fixed rules; detail is the command or path; folder uses "~"
+  | { type: "tool"; name: string; summary?: string; detail?: string; folder?: string }
   | { type: "delta"; text: string }
   | { type: "notice"; message: string } // e.g. a tool call was denied because no one could approve it
   | { type: "error"; message: string }

@@ -25,6 +25,7 @@ import { clearVoicePreference, readVoicePreference, writeVoicePreference } from 
 import { uid } from "./uid";
 import { authHeaders, checkAuthorized, UnauthorizedError } from "./auth";
 import { UnauthorizedScreen } from "./UnauthorizedScreen";
+import { ToolActivityStack, useToolActivity } from "./ToolActivity";
 import { harnessLabel, splitHostKey, type HarnessId, type SessionsResponse, type TurnEvent } from "./session-types";
 
 interface AppProps {
@@ -190,6 +191,7 @@ export default function App({ sessionKey, folder }: AppProps) {
   });
   const [unauthorized, setUnauthorized] = useState(false);
   const [statusText, setStatusText] = useState("");
+  const toolActivity = useToolActivity();
   const [usingFallbackVad, setUsingFallbackVad] = useState(false);
   const [voiceCatalogWarning, setVoiceCatalogWarning] = useState("");
   const [voiceLoading, setVoiceLoading] = useState(false);
@@ -668,13 +670,15 @@ export default function App({ sessionKey, folder }: AppProps) {
           case "tool":
             harnessTurnActive.current = true;
             updateState("running");
-            setStatusText(`Using ${event.name}…`);
+            setStatusText("");
+            toolActivity.push(event);
             return;
           case "delta": {
             if (harnessTurnActive.current) {
               harnessTurnActive.current = false;
               updateState("thinking");
             }
+            toolActivity.clear();
             pending += event.text;
             const result = consumeSpeechChunks(pending, false, !spoken);
             pending = result.rest;
@@ -719,7 +723,10 @@ export default function App({ sessionKey, folder }: AppProps) {
         activeChatKey.current = null;
       }
       harnessTurnActive.current = false;
-      if (mounted.current) setStatusText("");
+      if (mounted.current) {
+        setStatusText("");
+        toolActivity.clear();
+      }
       syncState();
     }
   };
@@ -1246,6 +1253,7 @@ export default function App({ sessionKey, folder }: AppProps) {
       </span>}
     </header>
     {statusText && <p className="room-status" role="status">{statusText}</p>}
+    <ToolActivityStack items={toolActivity.items} />
     {usingFallbackVad && <p className="room-status voice-fallback-notice" role="status">Using basic voice detection</p>}
     {!speechHealth.ready && <p className="voice-health" role="status">
       {speechHealth.error || speechStatusLabel}

@@ -3,6 +3,7 @@ import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, s
 import { homedir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { describeTool } from "./tool-activity.js";
 import type { HarnessAdapter, SendTarget, SessionInfo, TurnEvent } from "./types.js";
 
 const TAIL_BYTES = 64 * 1024;
@@ -368,7 +369,7 @@ export function createClaudeAdapter(options: ClaudeOptions = {}): HarnessAdapter
             for (const block of content) {
               if (block && typeof block === "object" && (block as Record<string, unknown>).type === "tool_use") {
                 const name = (block as Record<string, unknown>).name;
-                if (typeof name === "string") events.push({ type: "tool", name });
+                if (typeof name === "string") events.push({ type: "tool", name, ...describeTool(name, (block as Record<string, unknown>).input, target.cwd) });
               }
             }
           }

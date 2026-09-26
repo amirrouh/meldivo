@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Readable } from "node:stream";
+import { describeTool } from "./tool-activity.js";
 import type { HarnessAdapter, SendTarget, SessionInfo, TurnEvent } from "./types.js";
 
 interface OpenCodeOptions {
@@ -663,11 +664,13 @@ async function* sendViaWarmServer(
       if (typeof part.id === "string" && typeof part.type === "string") {
         partTypeByPartId.set(part.id, part.type);
       }
-      if (part.type === "tool" && typeof part.id === "string" && !toolEventsEmitted.has(part.id)) {
+      // Wait for the call's arguments: a tool part first arrives "pending" with no input yet.
+      const state = part.state as Record<string, unknown> | undefined;
+      if (part.type === "tool" && typeof part.id === "string" && !toolEventsEmitted.has(part.id) && state?.status !== "pending") {
         const name = (part as Record<string, unknown>).tool;
         if (typeof name === "string") {
           toolEventsEmitted.add(part.id);
-          push({ type: "tool", name });
+          push({ type: "tool", name, ...describeTool(name, state?.input, target.cwd) });
         }
       }
       return;

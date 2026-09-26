@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from "n
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { describeTool } from "./tool-activity.js";
 import type { HarnessAdapter, SendTarget, SessionInfo, TurnEvent } from "./types.js";
 
 /** Loaded into every turn's pi process: thinking off for the first reply (see pi-voice-extension.ts). */
@@ -326,7 +327,7 @@ export function createPiAdapter(options: PiOptions = {}): HarnessAdapter {
           }
         } else if (type === "tool_execution_start") {
           const name = obj.toolName;
-          if (typeof name === "string") events.push({ type: "tool", name });
+          if (typeof name === "string") events.push({ type: "tool", name, ...describeTool(name, obj.args, target.cwd) });
         }
         resolveNext?.();
       }
