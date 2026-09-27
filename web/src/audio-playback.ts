@@ -11,21 +11,33 @@ export function prepareAudioBuffer(
     const analyser = audio.createAnalyser();
     analyser.fftSize = 128;
     analyser.connect(destination);
+    // A gain node just for the fade: a barge-in pause (SpeechPipeline.hold()) aborts this like
+    // any other cutoff, and must stop the source with a short ramp rather than an instant click.
+    const gain = audio.createGain();
+    gain.connect(analyser);
     const source = audio.createBufferSource();
     source.buffer = buffer;
-    source.connect(analyser);
+    source.connect(gain);
     await new Promise<void>((resolve, reject) => {
+      const teardown = () => {
+        source.disconnect();
+        gain.disconnect();
+        analyser.disconnect();
+      };
       const cancel = () => {
         source.onended = null;
-        try { source.stop(); } catch { /* already stopped */ }
-        source.disconnect();
-        analyser.disconnect();
+        const now = audio.currentTime;
+        gain.gain.cancelScheduledValues(now);
+        gain.gain.setValueAtTime(gain.gain.value, now);
+        gain.gain.linearRampToValueAtTime(0, now + streamFadeSeconds);
+        try { source.stop(now + streamFadeSeconds); } catch { /* already stopped */ }
+        // Let the fade-out ramp finish playing before disconnecting the node graph.
+        setTimeout(teardown, streamFadeSeconds * 1_000 + 20);
         reject(signal.reason);
       };
       source.onended = () => {
         signal.removeEventListener("abort", cancel);
-        source.disconnect();
-        analyser.disconnect();
+        teardown();
         resolve();
       };
       signal.addEventListener("abort", cancel, { once: true });
@@ -156,7 +168,7 @@ export async function prepareAudioStream(
   let firstAudio!: () => void;
   let firstFailed!: (error: unknown) => void;
   const first = new Promise<void>((resolve, reject) => { firstAudio = resolve; firstFailed = reject; });
-  const completed = (async () => {
+  const completed = (async (): Promise<number> => {
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -172,6 +184,9 @@ export async function prepareAudioStream(
         notify();
       }
       if (!received) throw new Error("The speech server sent no audio");
+      // The whole phrase's actual duration, once known - used to refine a barge-in's estimated
+      // cut position (see cut-sentence.ts) if the pause happens after the stream has finished.
+      return received / sampleRate;
     } finally {
       ended = true;
       fetchSignal.removeEventListener("abort", cancelRead);

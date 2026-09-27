@@ -4,11 +4,13 @@ import { removeAssistantEcho } from "./assistant-echo";
 import { isCurrentVoiceSession, SerializedVadTransitions, VoiceInputCoordinator } from "./input-coordinator";
 import { LiveTranscription } from "./live-transcription";
 import {
-  acousticGateFrames, BargeInGuard, findDeliberateCue, isBelowEchoFloor, isMeaningfulSpeech, meaningfulSpeechMs,
-  previewFreshnessMs, recentPlaybackWindow, recordPlayedPhrase, type PlayedPhrase,
+  acousticGateFrames, BargeInGuard, estimatePhraseSeconds, findDeliberateCue, isBelowEchoFloor, isMeaningfulSpeech,
+  meaningfulSpeechMs, previewFreshnessMs, recentPlaybackWindow, recordPlayedPhrase, type PlayedPhrase,
 } from "./barge-in-guard";
 import { prepareAudioBuffer, prepareAudioStream } from "./audio-playback";
 import { SpeechPipeline, type PreparedSpeech } from "./speech-pipeline";
+import { cutSentence } from "./cut-sentence";
+import { fetchResumeBridge, withBridge } from "./resume-bridge";
 import {
   vadNegativeSpeechThreshold, vadOptionsFor, vadPositiveSpeechThreshold, vadRedemptionMsMax, vadRedemptionMsMin, vadRedemptionMsStep,
 } from "./vad-config";
@@ -213,6 +215,17 @@ export default function App({ sessionKey, folder }: AppProps) {
   const candidateGateRmsSum = useRef(0);
   const candidateGateDecided = useRef(false);
   const interruptTimer = useRef<number | null>(null);
+  // The phrase the speech pipeline is currently playing: its full text, when its audio actually
+  // started, and its expected duration (refined to the real PCM length once known). Used only to
+  // estimate how far into it a barge-in pause landed; cleared once the phrase finishes normally.
+  const currentPhrase = useRef<{ text: string; startedAt: number; seconds: number } | null>(null);
+  // Set the moment a barge-in's acoustic gate pauses the reply (see pauseForBargeIn), and cleared
+  // the moment its fate is decided (resumed or the turn is aborted). Guards every "bring the
+  // paused reply back" call site against firing when nothing was actually paused.
+  const bargePaused = useRef(false);
+  // What to resume with, captured at pause time: the sentence that was cut off, and (for the
+  // hub's bridge phrase) roughly what had already been said just before it.
+  const pendingResume = useRef<{ said: string; resume: string } | null>(null);
   const cueState = useRef(freshCueState());
   const cueAudioCache = useRef(new Map<string, AudioBuffer>());
   const cueController = useRef<AbortController | null>(null);
@@ -327,21 +340,62 @@ export default function App({ sessionKey, folder }: AppProps) {
       if (mounted.current) setStatusText((current) => (current === warmingStatus ? "" : current));
     }
   };
-  // Silences the reply almost at once (a few ms fade, no click) when the user starts talking
-  // over it; restoreOutput brings it back if what they said turns out not to count.
-  const silenceOutput = () => {
-    const gain = outputGain.current;
-    const context = audio.current;
-    if (!gain || !context) return;
-    gain.gain.cancelScheduledValues(context.currentTime);
-    gain.gain.setTargetAtTime(0, context.currentTime, 0.01);
-  };
+  // Restores the output gain to full volume. No longer used to undo an interruption (see
+  // pauseForBargeIn/resumeAfterBargeIn below, which pause and resume the speech pipeline
+  // itself instead of the gain), but kept as a safety net for anything that ever left it down.
   const restoreOutput = () => {
     const gain = outputGain.current;
     const context = audio.current;
     if (!gain || !context) return;
     gain.gain.cancelScheduledValues(context.currentTime);
     gain.gain.setTargetAtTime(1, context.currentTime, 0.015);
+  };
+  // Called at a barge-in's acoustic-gate pass (~0.25s into a candidate that is clearly louder
+  // than the learned echo floor): pauses the reply in place - a short fade, no click, via
+  // SpeechPipeline.hold() - instead of just muting it, so the words themselves are not lost.
+  // The phrase that was interrupted is cut at the sentence containing the estimated position
+  // playback had reached, and everything from there on (including anything queued behind it) is
+  // remembered so it can be resumed, preceded by a bridge phrase, if the interruption turns out
+  // not to be meaningful (see resumeAfterBargeIn).
+  const pauseForBargeIn = () => {
+    const held = pipeline.current?.hold() ?? false;
+    if (!held) return;
+    bargePaused.current = true;
+    const phrase = currentPhrase.current;
+    currentPhrase.current = null;
+    if (phrase) {
+      const elapsedSeconds = (performance.now() - phrase.startedAt) / 1_000;
+      const fraction = phrase.seconds > 0 ? elapsedSeconds / phrase.seconds : 1;
+      const resume = cutSentence(phrase.text, fraction);
+      // What was said just before the cut, for the hub's bridge phrase - the whole phrase is
+      // a suffix of assistantAudio (appended in full when it started playing), so what led up
+      // to the cut is whatever remains once the resumed suffix is removed from the end of it.
+      const said = assistantAudio.current.slice(0, assistantAudio.current.length - resume.length).trim();
+      pendingResume.current = resume ? { said, resume } : null;
+    } else {
+      pendingResume.current = null;
+    }
+  };
+  // Brings a paused reply back once a barge-in turns out not to be a real interruption (no
+  // meaningful words, or none by the time speech ended): asks the hub for a short bridge phrase
+  // and resumes the speech pipeline with it, in front of the sentence that was cut off (which is
+  // itself followed by whatever was already queued). A no-op unless pauseForBargeIn actually
+  // paused something. If there is nothing left to resume (the phrase had already finished), the
+  // pipeline is simply released to carry on with whatever is queued - nothing new is spoken.
+  const resumeAfterBargeIn = () => {
+    if (!bargePaused.current) return;
+    bargePaused.current = false;
+    const pending = pendingResume.current;
+    pendingResume.current = null;
+    const target = pipeline.current;
+    if (!target || !pending) {
+      target?.resume("");
+      return;
+    }
+    void fetchResumeBridge(pending.said, pending.resume, authHeaders()).then((bridge) => {
+      if (pipeline.current !== target) return;
+      target.resume(withBridge(bridge, pending.resume));
+    });
   };
   // Something the user is part of is under way (heard, transcribed, answered or spoken);
   // cue synthesis must not compete with it for the speech server.
@@ -462,8 +516,12 @@ export default function App({ sessionKey, folder }: AppProps) {
     chat.current = null;
     pipeline.current?.cancel();
     stopMeter();
-    // A reply silenced by a barge-in is gone now; the next one plays at full volume.
+    // A reply paused by a barge-in is gone now, along with anything it would have resumed with;
+    // the next one plays at full volume from a fresh pipeline run.
     restoreOutput();
+    bargePaused.current = false;
+    pendingResume.current = null;
+    currentPhrase.current = null;
     cueState.current = endTurn(cueState.current);
     stopCueWatcher();
     if (wasActive) {
@@ -588,6 +646,9 @@ export default function App({ sessionKey, folder }: AppProps) {
     const context = audio.current;
     if (!context) throw new Error("Audio output is not ready.");
     const playback = Symbol("playback");
+    // The best known spoken duration of this phrase: refined below once the stream's actual PCM
+    // length is known, or set from the decoded buffer's exact duration for a non-streamed reply.
+    let expectedSeconds = estimatePhraseSeconds(text);
     const playbackStarted = (analyser: AnalyserNode) => {
       // The real reply wins over a working cue that happens to still be playing.
       cueController.current?.abort();
@@ -598,6 +659,9 @@ export default function App({ sessionKey, folder }: AppProps) {
       // Recorded separately, with a timestamp, so a barge-in can be judged against what
       // was actually playing recently rather than the whole turn's text.
       playedPhrases.current = recordPlayedPhrase(playedPhrases.current, text, performance.now());
+      // Tracked so a barge-in mid-phrase can estimate how far into it playback had reached (see
+      // pauseForBargeIn/cutSentence); cleared once the phrase finishes playing normally, below.
+      currentPhrase.current = { text: text.trim(), startedAt: performance.now(), seconds: expectedSeconds };
       startMeter(analyser, playback);
     };
     const response = await fetch("/api/voice/speech", {
@@ -617,11 +681,18 @@ export default function App({ sessionKey, folder }: AppProps) {
       // Streamed: start playing the first words while the rest of the phrase is still being made.
       const sampleRate = Number(response.headers.get("x-sample-rate")) || 24_000;
       prepared = await prepareAudioStream(response.body, sampleRate, context, outputGain.current ?? context.destination, playbackStarted, signal);
+      // Refines expectedSeconds (and, if this phrase is already playing, currentPhrase itself)
+      // to the stream's real PCM duration once fully received, instead of the rough estimate.
+      prepared.completed?.then((seconds) => {
+        expectedSeconds = seconds;
+        if (currentPhrase.current?.text === text.trim()) currentPhrase.current.seconds = seconds;
+      }, () => undefined);
     } else {
       const bytes = await response.arrayBuffer();
       signal.throwIfAborted();
       const buffer = await context.decodeAudioData(bytes);
       signal.throwIfAborted();
+      expectedSeconds = buffer.duration;
       prepared = prepareAudioBuffer(
         buffer,
         context,
@@ -631,7 +702,13 @@ export default function App({ sessionKey, folder }: AppProps) {
     }
     const play = (async (playbackSignal: AbortSignal) => {
       try { await prepared(playbackSignal); }
-      finally { stopMeter(playback); syncState(); }
+      finally {
+        stopMeter(playback);
+        // A phrase that finishes on its own (as opposed to being paused mid-way) leaves nothing
+        // to track a barge-in against.
+        if (currentPhrase.current?.text === text.trim()) currentPhrase.current = null;
+        syncState();
+      }
     }) as PreparedSpeech;
     play.completed = prepared.completed;
     return play;
@@ -1080,8 +1157,8 @@ export default function App({ sessionKey, folder }: AppProps) {
           }
           // Not meaningful (or the acoustic gate did not trust the word path): drop it
           // silently, exactly as a fresh-but-unmeaningful preview would have at speech end,
-          // and let the reply be heard again.
-          restoreOutput();
+          // and bring the paused reply back (see resumeAfterBargeIn).
+          resumeAfterBargeIn();
           return "";
         },
         sendMessage,
@@ -1151,7 +1228,7 @@ export default function App({ sessionKey, folder }: AppProps) {
           recentWindow.current = "";
           transcription.current?.discard();
           input.current?.speechDiscarded();
-          restoreOutput();
+          resumeAfterBargeIn();
           if (!muted.current) syncState();
         },
         onFrameProcessed: (probabilities: { isSpeech: number }, frame: Float32Array) => {
@@ -1173,10 +1250,11 @@ export default function App({ sessionKey, folder }: AppProps) {
               candidateGateDecided.current = true;
               const mean = candidateGateRmsSum.current / candidateGateFrames.current;
               if (isBelowEchoFloor(mean, echoFloor.current)) bargeIn.current.blockWordPath();
-              // Clearly louder than the reply's own echo: the user is talking, so stop the reply
-              // being heard now (~a quarter second in) rather than when the words are transcribed.
-              // If they turn out to be a cough or filler, the reply comes back.
-              else if (echoFloor.current !== null) silenceOutput();
+              // Clearly louder than the reply's own echo: the user is talking, so pause the reply
+              // now (~a quarter second in) rather than when the words are transcribed. If they
+              // turn out to be a cough or filler, it resumes from where it was cut (see
+              // pauseForBargeIn); if not, the turn is aborted and their words are sent instead.
+              else if (echoFloor.current !== null) pauseForBargeIn();
             }
           }
         },
@@ -1197,13 +1275,19 @@ export default function App({ sessionKey, folder }: AppProps) {
             recentWindow.current = "";
             transcription.current?.discard();
             input.current?.speechDiscarded();
-            restoreOutput();
+            resumeAfterBargeIn();
             syncState();
             return;
           }
-          // A silenced reply stays silent while its fate waits for the final transcript.
-          if (!decision.deferDecision) restoreOutput();
-          if (decision.interrupt) interruptActiveTurn();
+          if (decision.interrupt) {
+            interruptActiveTurn();
+          } else if (!decision.deferDecision) {
+            // A fresh preview said only filler, echo, or nothing (or this was never a candidate
+            // to interrupt at all): bring a paused reply back instead of restarting it - a no-op
+            // if pauseForBargeIn never actually paused anything.
+            resumeAfterBargeIn();
+          }
+          // A paused reply stays paused (held) while its fate waits for the final transcript.
           if (!decision.send) {
             // A fresh preview said only filler, echo, or nothing, and the reply was never
             // interrupted: let it keep playing and drop this recording.

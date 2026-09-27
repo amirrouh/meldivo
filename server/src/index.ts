@@ -12,6 +12,7 @@ import type { HarnessAdapter, HarnessId, SendTarget, SessionInfo, TurnEvent } fr
 import { createAccessGate, notFound } from "./access.js";
 import { createLogger, requestLoggingMiddleware } from "./logger.js";
 import { createHub, hubSpeech, type Hub, type TurnSink } from "./hub.js";
+import { writeBridge } from "./bridge.js";
 import { loadHubLink, startMachineClient, type HubLink, type MachineClient } from "./machine-client.js";
 import { MACHINE_NAME, parseMachineKey } from "./protocol.js";
 import { detectRemoteOptions, RemoteManager, remoteGuideUrl, type RemoteId } from "./remote.js";
@@ -630,6 +631,24 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   app.delete("/api/remote", async (_req, res) => {
     await remoteManager.stop();
     res.status(204).end();
+  });
+
+  // A spoken bridge for resuming a reply the user almost interrupted (see bridge.ts). The text is
+  // only passed to the user's own model and never logged.
+  app.post("/api/voice/bridge", async (req, res) => {
+    const said = typeof req.body?.said === "string" ? req.body.said.slice(-400) : "";
+    const resume = typeof req.body?.resume === "string" ? req.body.resume.slice(0, 400) : "";
+    if (!resume.trim()) return res.status(400).json({ error: "resume is required" });
+    const controller = abortOnDisconnect(req, res);
+    const started = Date.now();
+    let bridge = "";
+    try {
+      bridge = await writeBridge(said, resume, controller.signal);
+    } catch {
+      // No bridge: the reply simply resumes with the sentence itself.
+    }
+    logger.info("voice_bridge", { ms: Date.now() - started, written: Boolean(bridge) });
+    if (!res.destroyed) res.set("Cache-Control", "no-store").json({ bridge });
   });
 
   // Durations the page measured for one voice turn (numbers only, never text).
