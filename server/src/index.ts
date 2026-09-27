@@ -651,6 +651,19 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     if (!res.destroyed) res.set("Cache-Control", "no-store").json({ bridge });
   });
 
+  // What the page's barge-in logic decided (kinds and counts only, never text), for debugging.
+  app.post("/api/voice/event", (req, res) => {
+    const kind = typeof req.body?.kind === "string" && /^[a-z_]{1,40}$/.test(req.body.kind) ? req.body.kind : undefined;
+    if (!kind) return res.status(400).end();
+    const fields: Record<string, number | boolean | string> = { kind };
+    for (const [name, value] of Object.entries(req.body ?? {})) {
+      if (name === "kind" || !/^[a-z_]{1,24}$/.test(name)) continue;
+      if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) fields[name] = value;
+    }
+    logger.info("voice_event", fields);
+    res.status(204).end();
+  });
+
   // Durations the page measured for one voice turn (numbers only, never text).
   app.post("/api/voice/timing", (req, res) => {
     const fields: Record<string, number> = {};

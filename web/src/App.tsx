@@ -357,10 +357,37 @@ export default function App({ sessionKey, folder }: AppProps) {
   // playback had reached, and everything from there on (including anything queued behind it) is
   // remembered so it can be resumed, preceded by a bridge phrase, if the interruption turns out
   // not to be meaningful (see resumeAfterBargeIn).
+  // What the barge-in logic decided, for the hub log: kinds and counts only, never any words.
+  const logVoiceEvent = (kind: string, fields: Record<string, number | boolean> = {}) => {
+    void fetch("/api/voice/event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ kind, ...fields }),
+    }).catch(() => undefined);
+  };
+  const resumeWatchdog = useRef<number | null>(null);
   const pauseForBargeIn = () => {
     const held = pipeline.current?.hold() ?? false;
+    logVoiceEvent("barge_pause", { held });
     if (!held) return;
     bargePaused.current = true;
+    // Safety net: whatever path the interruption takes, a reply is never left paused once the
+    // user has gone quiet and nothing is still deciding its fate.
+    if (resumeWatchdog.current !== null) window.clearInterval(resumeWatchdog.current);
+    let quietSince = 0;
+    resumeWatchdog.current = window.setInterval(() => {
+      if (!bargePaused.current) {
+        window.clearInterval(resumeWatchdog.current!);
+        resumeWatchdog.current = null;
+        return;
+      }
+      const deciding = stateRef.current === "hearing" || Boolean(input.current?.busy);
+      quietSince = deciding ? 0 : quietSince || Date.now();
+      if (quietSince && Date.now() - quietSince >= 2_500) {
+        logVoiceEvent("barge_resume_watchdog");
+        resumeAfterBargeIn();
+      }
+    }, 250);
     const phrase = currentPhrase.current;
     currentPhrase.current = null;
     if (phrase) {
@@ -388,6 +415,7 @@ export default function App({ sessionKey, folder }: AppProps) {
     const pending = pendingResume.current;
     pendingResume.current = null;
     const target = pipeline.current;
+    logVoiceEvent("barge_resume", { with_sentence: Boolean(pending) });
     if (!target || !pending) {
       target?.resume("");
       return;
@@ -534,7 +562,9 @@ export default function App({ sessionKey, folder }: AppProps) {
     if (!muted.current && started.current) updateState("listening");
   };
   const interruptActiveTurn = () => {
-    if (hasActiveVoiceTurn(Boolean(chat.current), Boolean(pipeline.current?.busy), speaking.current)) abortTurn();
+    const active = hasActiveVoiceTurn(Boolean(chat.current), Boolean(pipeline.current?.busy), speaking.current);
+    logVoiceEvent("barge_interrupt", { active, paused: bargePaused.current });
+    if (active) abortTurn();
   };
   const deactivateVoice = (message: string) => {
     if (!started.current && !starting.current) return;
@@ -1143,7 +1173,12 @@ export default function App({ sessionKey, folder }: AppProps) {
           const transcript = await (nextTranscription?.finish(recording.samples, signal) ?? transcribe(recording.samples, signal));
           const stripped = recording.possibleEcho ? removeAssistantEcho(transcript, recording.possibleEcho) : transcript;
           const pending = recording.pendingInterruptDecision;
-          if (!pending) return stripped;
+          const heardWords = stripped.trim() ? stripped.trim().split(/\s+/).length : 0;
+          if (!pending) {
+            if (bargePaused.current) logVoiceEvent("barge_send_while_paused", { words: heardWords });
+            return stripped;
+          }
+          logVoiceEvent("barge_final_decision", { words: heardWords, blocked: pending.wordPathBlocked });
           // The live preview was empty or stale at speech end, so the interrupt/send
           // decision waited for this, the final transcript (see BargeInGuard.speechEnd).
           const cue = findDeliberateCue(stripped, pending.recentWindow);
@@ -1268,6 +1303,12 @@ export default function App({ sessionKey, folder }: AppProps) {
           );
           const decisionWindow = recentWindow.current;
           const decision = bargeIn.current.speechEnd(partialTranscript.current, decisionWindow, freshPreview);
+          if (bargePaused.current) {
+            logVoiceEvent("barge_speech_end", {
+              accepted: decision.accepted, interrupt: Boolean(decision.interrupt), send: Boolean(decision.send),
+              deferred: Boolean(decision.deferDecision), fresh: freshPreview,
+            });
+          }
           partialTranscript.current = "";
           partialTranscriptAt.current = 0;
           if (!decision.accepted) {
