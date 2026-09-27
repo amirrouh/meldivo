@@ -77,6 +77,12 @@ Commands, phone access, multi-machine hubs, speech servers, configuration, and
 security are all covered in the
 **[documentation](https://github.com/amirrouh/meldivo/blob/main/docs/README.md)**.
 
+## Acknowledgements
+
+Some of the methods used in meldivo were inspired by, and adapted from, the ones described in
+[How I Built an End-to-End Local Voice Agent, and Made It Fast](https://youtu.be/xbedfuqYQYA) by Codacus
+and used in his [Pithagoras](https://github.com/thecodacus/pithagoras) project.
+
 ## License
 
 MIT. See [LICENSE](https://github.com/amirrouh/meldivo/blob/main/LICENSE) and
