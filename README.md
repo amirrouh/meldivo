@@ -19,6 +19,11 @@
   <img src="https://raw.githubusercontent.com/amirrouh/meldivo/main/assets/meldivo-demo.gif" alt="Install meldivo, start it, and talk to a Claude Code session in the browser" width="720">
 </p>
 
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=jnRBIvbxwRc"><img src="https://img.youtube.com/vi/jnRBIvbxwRc/maxresdefault.jpg" alt="Watch the meldivo tutorial on YouTube" width="480"></a><br>
+  <sub>▶ Watch the tutorial: set up meldivo and talk to your agents hands-free.</sub>
+</p>
+
 ---
 
 ## Get started in three steps
