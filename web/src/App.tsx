@@ -37,6 +37,7 @@ import { clearVoicePreference, readVoicePreference, writeVoicePreference } from 
 import { uid } from "./uid";
 import { authHeaders, checkAuthorized, UnauthorizedError } from "./auth";
 import { UnauthorizedScreen } from "./UnauthorizedScreen";
+import { VoiceEqualizer } from "./VoiceEqualizer";
 import { ToolActivityStack, useToolActivity } from "./ToolActivity";
 import { harnessLabel, splitHostKey, type HarnessId, type SessionsResponse, type TurnEvent } from "./session-types";
 
@@ -1886,7 +1887,7 @@ export default function App({ sessionKey, folder }: AppProps) {
       <span className="voice-shape__halo" />
       <span className="voice-shape__ring voice-shape__ring--one" />
       <span className="voice-shape__ring voice-shape__ring--two" />
-      <span className="voice-shape__core" />
+      <VoiceEqualizer state={state} level={level} />
     </button>
     {contextMenu && <div
       ref={contextMenuRef}
