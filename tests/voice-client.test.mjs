@@ -575,7 +575,7 @@ test("VAD candidate ducks an active assistant turn and a misfire leaves it alive
 test("VAD candidate ducks audible output and begins a pending transcript", () => {
   const guard = new BargeInGuard();
   assert.deepEqual(guard.speechStart(true), { duck: true, begin: true, accepted: false });
-  assert.deepEqual(guard.speechEnd("", ""), { accepted: false, interrupt: false, send: false });
+  assert.deepEqual(guard.speechEnd("", "", true), { accepted: false, interrupt: false, send: false, deferDecision: false, wordPathBlocked: false });
 });
 
 test("a short VAD misfire discards its pending transcript without an STT request", async () => {
@@ -589,7 +589,7 @@ test("a short VAD misfire discards its pending transcript without an STT request
   live.discard();
   await tick();
   assert.equal(requests, 0);
-  assert.deepEqual(guard.speechEnd("", ""), { accepted: false, interrupt: false, send: false });
+  assert.deepEqual(guard.speechEnd("", "", true), { accepted: false, interrupt: false, send: false, deferDecision: false, wordPathBlocked: false });
 });
 
 test("confirmed speech no longer interrupts immediately, only once it says something meaningful", () => {
@@ -601,7 +601,7 @@ test("confirmed speech no longer interrupts immediately, only once it says somet
   assert.equal(guard.shouldInterruptNow("um", ""), false);
   assert.equal(guard.shouldInterruptNow("stop that", ""), true);
   assert.equal(guard.shouldInterruptNow("stop that now", ""), false); // already interrupted once
-  assert.deepEqual(guard.speechEnd("stop that", ""), { accepted: true, interrupt: false, send: true });
+  assert.deepEqual(guard.speechEnd("stop that", "", true), { accepted: true, interrupt: false, send: true, deferDecision: false, wordPathBlocked: false });
 });
 
 test("a short filler at speech end never interrupts and the recording is dropped", () => {
@@ -609,7 +609,7 @@ test("a short filler at speech end never interrupts and the recording is dropped
   guard.speechStart(true);
   guard.speechRealStart();
   assert.equal(guard.shouldInterruptNow("um", ""), false);
-  assert.deepEqual(guard.speechEnd("um", ""), { accepted: true, interrupt: false, send: false });
+  assert.deepEqual(guard.speechEnd("um", "", true), { accepted: true, interrupt: false, send: false, deferDecision: false, wordPathBlocked: false });
 });
 
 test("meaningful speech only recognized at speech end still interrupts, and is sent", () => {
@@ -617,13 +617,13 @@ test("meaningful speech only recognized at speech end still interrupts, and is s
   guard.speechStart(true);
   guard.speechRealStart();
   assert.equal(guard.shouldInterruptNow("uh", ""), false);
-  assert.deepEqual(guard.speechEnd("wait, stop", ""), { accepted: true, interrupt: true, send: true });
+  assert.deepEqual(guard.speechEnd("wait, stop", "", true), { accepted: true, interrupt: true, send: true, deferDecision: false, wordPathBlocked: false });
 });
 
 test("a candidate that never accepts (VAD misfire) does not interrupt or send", () => {
   const guard = new BargeInGuard();
   guard.speechStart(true);
-  assert.deepEqual(guard.speechEnd("stop that", ""), { accepted: false, interrupt: false, send: false });
+  assert.deepEqual(guard.speechEnd("stop that", "", true), { accepted: false, interrupt: false, send: false, deferDecision: false, wordPathBlocked: false });
 });
 
 test("speech after natural playback end starts a normal turn regardless of transcript", () => {
@@ -631,7 +631,7 @@ test("speech after natural playback end starts a normal turn regardless of trans
   assert.deepEqual(guard.speechStart(false), { duck: false, begin: true, accepted: false });
   assert.deepEqual(guard.speechRealStart(), { keepDucked: false, begin: false, accepted: true });
   // No active turn to interrupt, so even filler is sent as an ordinary turn.
-  assert.deepEqual(guard.speechEnd("um", ""), { accepted: true, interrupt: false, send: true });
+  assert.deepEqual(guard.speechEnd("um", "", true), { accepted: true, interrupt: false, send: true, deferDecision: false, wordPathBlocked: false });
 });
 
 test("shouldInterruptNow ignores a candidate that has not yet been confirmed", () => {

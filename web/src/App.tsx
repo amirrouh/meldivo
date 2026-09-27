@@ -3,7 +3,10 @@ import type { MicVAD } from "@ricky0123/vad-web";
 import { removeAssistantEcho } from "./assistant-echo";
 import { isCurrentVoiceSession, SerializedVadTransitions, VoiceInputCoordinator } from "./input-coordinator";
 import { LiveTranscription } from "./live-transcription";
-import { BargeInGuard, meaningfulSpeechMs } from "./barge-in-guard";
+import {
+  acousticGateFrames, BargeInGuard, findDeliberateCue, isBelowEchoFloor, isMeaningfulSpeech, meaningfulSpeechMs,
+  previewFreshnessMs, recentPlaybackWindow, recordPlayedPhrase, type PlayedPhrase,
+} from "./barge-in-guard";
 import { prepareAudioBuffer, prepareAudioStream } from "./audio-playback";
 import { SpeechPipeline, type PreparedSpeech } from "./speech-pipeline";
 import {
@@ -194,6 +197,21 @@ export default function App({ sessionKey, folder }: AppProps) {
   const ownership = useRef<VoiceOwnership | null>(null);
   const bargeIn = useRef(new BargeInGuard());
   const partialTranscript = useRef("");
+  // When the live preview text was last updated, so speechEnd can tell a fresh preview
+  // (safe to judge on the spot) from a stale or missing one (never used to drop speech).
+  const partialTranscriptAt = useRef(0);
+  // Every phrase recently played (a reply or a working cue), so an interruption can be
+  // judged against what the mic could actually be hearing back, not the whole turn so far.
+  const playedPhrases = useRef<PlayedPhrase[]>([]);
+  // The played-phrase window captured once at the start of the current speech candidate;
+  // reused for every check (mid-speech and at speech end) against that same candidate.
+  const recentWindow = useRef("");
+  // Echo floor: a running estimate of the mic's own RMS level while the assistant is
+  // speaking and no speech candidate is open - i.e. residual echo, not real speech.
+  const echoFloor = useRef<number | null>(null);
+  const candidateGateFrames = useRef(0);
+  const candidateGateRmsSum = useRef(0);
+  const candidateGateDecided = useRef(false);
   const interruptTimer = useRef<number | null>(null);
   const cueState = useRef(freshCueState());
   const cueAudioCache = useRef(new Map<string, AudioBuffer>());
@@ -378,6 +396,7 @@ export default function App({ sessionKey, folder }: AppProps) {
     // Set for echo removal exactly like a real reply, so a barge-in over a cue works.
     const priorAssistantAudio = assistantAudio.current;
     assistantAudio.current = text;
+    playedPhrases.current = recordPlayedPhrase(playedPhrases.current, text, performance.now());
     const prepared = prepareAudioBuffer(buffer, context, outputGain.current ?? context.destination, (analyser) => startMeter(analyser, playback));
     try {
       await prepared(signal);
@@ -463,6 +482,8 @@ export default function App({ sessionKey, folder }: AppProps) {
     bargeIn.current.reset();
     clearInterruptTimer();
     partialTranscript.current = "";
+    partialTranscriptAt.current = 0;
+    recentWindow.current = "";
     transcription.current?.reset();
     transcription.current = null;
     input.current?.reset();
@@ -499,6 +520,8 @@ export default function App({ sessionKey, folder }: AppProps) {
     bargeIn.current.reset();
     clearInterruptTimer();
     partialTranscript.current = "";
+    partialTranscriptAt.current = 0;
+    recentWindow.current = "";
     transcription.current?.reset();
     transcription.current = null;
     input.current?.reset();
@@ -558,8 +581,12 @@ export default function App({ sessionKey, folder }: AppProps) {
       // The real reply wins over a working cue that happens to still be playing.
       cueController.current?.abort();
       reportTurnTiming();
-      // Everything said this turn, so echo of an earlier sentence is recognized too.
+      // Everything said this turn, so echo of an earlier sentence is recognized too
+      // (used only to strip an echoed prefix from what gets sent; see removeAssistantEcho).
       assistantAudio.current = `${assistantAudio.current} ${text.trim()}`.trim().slice(-2000);
+      // Recorded separately, with a timestamp, so a barge-in can be judged against what
+      // was actually playing recently rather than the whole turn's text.
+      playedPhrases.current = recordPlayedPhrase(playedPhrases.current, text, performance.now());
       startMeter(analyser, playback);
     };
     const response = await fetch("/api/voice/speech", {
@@ -765,6 +792,8 @@ export default function App({ sessionKey, folder }: AppProps) {
     bargeIn.current.reset();
     clearInterruptTimer();
     partialTranscript.current = "";
+    partialTranscriptAt.current = 0;
+    recentWindow.current = "";
     echoReference.current = "";
     transcription.current?.reset();
     input.current?.reset();
@@ -1018,12 +1047,29 @@ export default function App({ sessionKey, folder }: AppProps) {
       });
       nextTranscription = new LiveTranscription(transcribe, (text) => {
         partialTranscript.current = text;
+        partialTranscriptAt.current = performance.now();
         checkInterrupt(detector, session);
       }, () => endUtteranceEarly(detector, session));
       nextInput = new VoiceInputCoordinator(
         async (recording, signal) => {
           const transcript = await (nextTranscription?.finish(recording.samples, signal) ?? transcribe(recording.samples, signal));
-          return recording.possibleEcho ? removeAssistantEcho(transcript, recording.possibleEcho) : transcript;
+          const stripped = recording.possibleEcho ? removeAssistantEcho(transcript, recording.possibleEcho) : transcript;
+          const pending = recording.pendingInterruptDecision;
+          if (!pending) return stripped;
+          // The live preview was empty or stale at speech end, so the interrupt/send
+          // decision waited for this, the final transcript (see BargeInGuard.speechEnd).
+          const cue = findDeliberateCue(stripped, pending.recentWindow);
+          if (cue) {
+            interruptActiveTurn();
+            return cue.remainder;
+          }
+          if (!pending.wordPathBlocked && isMeaningfulSpeech(stripped, pending.recentWindow)) {
+            interruptActiveTurn();
+            return stripped;
+          }
+          // Not meaningful (or the acoustic gate did not trust the word path): drop it
+          // silently, exactly as a fresh-but-unmeaningful preview would have at speech end.
+          return "";
         },
         sendMessage,
         (caught) => report(caught instanceof Error ? caught.message : "Voice transcription failed."),
@@ -1047,8 +1093,16 @@ export default function App({ sessionKey, folder }: AppProps) {
           const activeTurn = hasActiveVoiceTurn(Boolean(chat.current), Boolean(pipeline.current?.busy), speaking.current);
           const decision = bargeIn.current.speechStart(activeTurn);
           echoReference.current = speaking.current || pipeline.current?.busy ? assistantAudio.current : "";
+          const speechStartAt = performance.now();
+          // Captured once, here, and reused for every check against this same candidate
+          // (mid-speech and at speech end): what was recently playing when it started.
+          recentWindow.current = recentPlaybackWindow(playedPhrases.current, speechStartAt, speechStartAt);
           partialTranscript.current = "";
-          if (decision.begin) transcription.current?.begin();
+          partialTranscriptAt.current = 0;
+          candidateGateFrames.current = 0;
+          candidateGateRmsSum.current = 0;
+          candidateGateDecided.current = false;
+          if (decision.begin) transcription.current?.begin(activeTurn);
           // No ducking: the mic often hears the reply itself, and dipping on every such blip made the
           // reply's volume pulse. A real interruption stops the reply once words are heard instead.
           armAcceptedWatchdog(detector, session);
@@ -1079,7 +1133,9 @@ export default function App({ sessionKey, folder }: AppProps) {
           bargeIn.current.reset();
           clearInterruptTimer();
           partialTranscript.current = "";
+          partialTranscriptAt.current = 0;
           echoReference.current = "";
+          recentWindow.current = "";
           transcription.current?.discard();
           input.current?.speechDiscarded();
           restoreOutput();
@@ -1088,17 +1144,40 @@ export default function App({ sessionKey, folder }: AppProps) {
         onFrameProcessed: (probabilities: { isSpeech: number }, frame: Float32Array) => {
           if (!isCurrentVad(detector, session)) return;
           transcription.current?.frame(probabilities.isSpeech, frame);
-          setLevel(Math.min(1, Math.sqrt(frame.reduce((total, value) => total + value * value, 0) / frame.length) * 7));
+          const rms = Math.sqrt(frame.reduce((total, value) => total + value * value, 0) / frame.length);
+          setLevel(Math.min(1, rms * 7));
+          if (speaking.current && bargeIn.current.idle) {
+            // The reply is playing and nothing is being said: this frame's level is
+            // (residual) echo, not speech. Folded into a slow-moving floor estimate.
+            echoFloor.current = echoFloor.current === null ? rms : echoFloor.current * 0.9 + rms * 0.1;
+          } else if (!bargeIn.current.idle && speaking.current && !candidateGateDecided.current) {
+            // The first ~250 ms of a candidate that started while the assistant was
+            // talking: too quiet next to the echo floor means the mic is probably still
+            // just hearing the reply, so this segment cannot interrupt via the word path.
+            candidateGateFrames.current++;
+            candidateGateRmsSum.current += rms;
+            if (candidateGateFrames.current >= acousticGateFrames) {
+              candidateGateDecided.current = true;
+              const mean = candidateGateRmsSum.current / candidateGateFrames.current;
+              if (isBelowEchoFloor(mean, echoFloor.current)) bargeIn.current.blockWordPath();
+            }
+          }
         },
         onSpeechEnd: (samples: Float32Array) => {
           if (!isCurrentVad(detector, session)) return;
           turnTiming.current = { speechEnd: performance.now() };
           clearAcceptedWatchdog();
           clearInterruptTimer();
-          const decision = bargeIn.current.speechEnd(partialTranscript.current, echoReference.current);
+          const freshPreview = (
+            partialTranscript.current.trim() !== "" && performance.now() - partialTranscriptAt.current <= previewFreshnessMs
+          );
+          const decisionWindow = recentWindow.current;
+          const decision = bargeIn.current.speechEnd(partialTranscript.current, decisionWindow, freshPreview);
           partialTranscript.current = "";
+          partialTranscriptAt.current = 0;
           if (!decision.accepted) {
             echoReference.current = "";
+            recentWindow.current = "";
             transcription.current?.discard();
             input.current?.speechDiscarded();
             restoreOutput();
@@ -1108,9 +1187,10 @@ export default function App({ sessionKey, folder }: AppProps) {
           restoreOutput();
           if (decision.interrupt) interruptActiveTurn();
           if (!decision.send) {
-            // Only filler, echo, or nothing was heard, and the reply was never
+            // A fresh preview said only filler, echo, or nothing, and the reply was never
             // interrupted: let it keep playing and drop this recording.
             echoReference.current = "";
+            recentWindow.current = "";
             transcription.current?.discard();
             input.current?.speechDiscarded();
             syncState();
@@ -1119,7 +1199,14 @@ export default function App({ sessionKey, folder }: AppProps) {
           transcription.current?.end(samples);
           const possibleEcho = echoReference.current;
           echoReference.current = "";
-          input.current?.speechEnded({ samples, possibleEcho });
+          recentWindow.current = "";
+          input.current?.speechEnded({
+            samples,
+            possibleEcho,
+            ...(decision.deferDecision
+              ? { pendingInterruptDecision: { recentWindow: decisionWindow, wordPathBlocked: decision.wordPathBlocked } }
+              : {}),
+          });
         },
       };
       // Loading the model does not touch the microphone (`startOnLoad: false`); the module and
@@ -1197,6 +1284,8 @@ export default function App({ sessionKey, folder }: AppProps) {
         bargeIn.current.reset();
         clearInterruptTimer();
         partialTranscript.current = "";
+        partialTranscriptAt.current = 0;
+        recentWindow.current = "";
         pipeline.current = null;
         transcription.current?.reset();
         transcription.current = null;
@@ -1356,7 +1445,7 @@ export default function App({ sessionKey, folder }: AppProps) {
   // something meaningful (not just a quick "um") or has run past the time limit.
   const checkInterrupt = (candidate: Detector | null, session: number) => {
     if (!isCurrentVad(candidate, session)) return;
-    if (bargeIn.current.shouldInterruptNow(partialTranscript.current, echoReference.current)) {
+    if (bargeIn.current.shouldInterruptNow(partialTranscript.current, recentWindow.current)) {
       clearInterruptTimer();
       interruptActiveTurn();
       restoreOutput();
@@ -1377,6 +1466,13 @@ export default function App({ sessionKey, folder }: AppProps) {
         return;
       }
     }
+    // A tap while a reply is running stops it instead of muting, and keeps listening -
+    // muting only ever happens from idle/listening, with a second tap needed to mute.
+    if (!muted.current && hasActiveVoiceTurn(Boolean(chat.current), Boolean(pipeline.current?.busy), speaking.current)) {
+      interruptActiveTurn();
+      restoreOutput();
+      return;
+    }
     muted.current = !muted.current;
     if (muted.current) {
       clearAcceptedWatchdog();
@@ -1385,6 +1481,8 @@ export default function App({ sessionKey, folder }: AppProps) {
       bargeIn.current.reset();
       clearInterruptTimer();
       partialTranscript.current = "";
+      partialTranscriptAt.current = 0;
+      recentWindow.current = "";
       transcription.current?.reset();
       input.current?.reset();
       stream.current?.getTracks().forEach((track) => { track.enabled = false; });
@@ -1559,6 +1657,8 @@ export default function App({ sessionKey, folder }: AppProps) {
     bargeIn.current.reset();
     clearInterruptTimer();
     partialTranscript.current = "";
+    partialTranscriptAt.current = 0;
+    recentWindow.current = "";
     transcription.current?.reset();
     input.current?.reset();
     input.current = null;
@@ -1575,7 +1675,10 @@ export default function App({ sessionKey, folder }: AppProps) {
 
   if (unauthorized) return <UnauthorizedScreen />;
 
-  const label = !started.current ? "Start voice conversation" : state === "muted" ? "Unmute microphone" : "Mute microphone";
+  const replyRunning = hasActiveVoiceTurn(Boolean(chat.current), Boolean(pipeline.current?.busy), speaking.current);
+  const label = !started.current
+    ? "Start voice conversation"
+    : state === "muted" ? "Unmute microphone" : replyRunning ? "Stop reply" : "Mute microphone";
   const contextLeft = contextMenu ? Math.max(12, Math.min(contextMenu.x, window.innerWidth - 170)) : 0;
   const contextTop = contextMenu ? Math.max(12, Math.min(contextMenu.y, window.innerHeight - 68)) : 0;
   const activeVoice = savedVoice || profileVoice;
@@ -1716,7 +1819,7 @@ export default function App({ sessionKey, folder }: AppProps) {
     {onboardingOpen && <div className="voice-onboarding" role="dialog" aria-modal="true" aria-labelledby="voice-onboarding-title">
       <div className="voice-onboarding__card">
         <h2 id="voice-onboarding-title">Welcome</h2>
-        <p>Tap to talk · hold or right-click for settings.</p>
+        <p>Tap to talk, or to stop a reply · hold or right-click for settings.</p>
         <button type="button" onClick={() => {
           try { window.localStorage.setItem(onboardingDismissedKey, "true"); } catch { /* Storage is optional. */ }
           setOnboardingOpen(false);

@@ -41,36 +41,78 @@ export function prepareAudioBuffer(
 // underrun (audio ran dry before the next chunk came) the restart lead doubles, up to a cap.
 export const streamFirstLeadSeconds = 0.1;
 export const streamUnderrunLeadSeconds = 0.02;
-export const streamMaxLeadSeconds = 0.16;
+export const streamMaxLeadSeconds = 0.5;
 
-export type StreamSchedule = { nextTime: number; started: boolean; underrunLead: number };
+// Before starting a phrase at all, wait for this much PCM to be buffered (or the stream to end),
+// so ordinary network jitter is absorbed before playback ever starts rather than causing an
+// underrun a few hundred milliseconds in.
+export const streamJitterBufferSeconds = 0.3;
+
+// Length of the gain ramp applied at the start of a phrase and after an underrun restart (to avoid
+// a click from starting mid-waveform), and when a phrase is cut off (to avoid a click from stopping
+// mid-waveform).
+export const streamFadeSeconds = 0.005;
+
+export type StreamSchedule = { nextTime: number; started: boolean; underrunLead: number; restarted: boolean };
 
 export function freshStreamSchedule(): StreamSchedule {
-  return { nextTime: 0, started: false, underrunLead: streamUnderrunLeadSeconds };
+  return { nextTime: 0, started: false, underrunLead: streamUnderrunLeadSeconds, restarted: false };
 }
 
 /** When the next merged chunk of `duration` seconds starts, given the audio clock `now`; advances the schedule. */
 export function scheduleStreamChunk(schedule: StreamSchedule, now: number, duration: number): number {
   let startAt: number;
+  let restarted: boolean;
   if (!schedule.started) {
     startAt = now + streamFirstLeadSeconds;
-  } else if (schedule.nextTime < now + streamUnderrunLeadSeconds) {
-    // Ran dry (or about to): restart just ahead of now instead of scheduling in the past, and keep more
+    restarted = true;
+  } else if (schedule.nextTime < now) {
+    // Actually ran dry: restart just ahead of now instead of scheduling in the past, and keep more
     // audio buffered from here on so a slow network doesn't stutter every chunk.
     startAt = now + schedule.underrunLead;
-    if (schedule.nextTime < now) schedule.underrunLead = Math.min(streamMaxLeadSeconds, schedule.underrunLead * 2);
+    schedule.underrunLead = Math.min(streamMaxLeadSeconds, schedule.underrunLead * 2);
+    restarted = true;
   } else {
+    // Still ahead of "now": schedule right after the previous chunk so playback stays contiguous.
     startAt = schedule.nextTime;
+    restarted = false;
   }
   schedule.started = true;
+  schedule.restarted = restarted;
   schedule.nextTime = startAt + duration;
   return startAt;
 }
 
+/** Total duration, in seconds, of PCM chunks still waiting to be scheduled. */
+export function bufferedDurationSeconds(chunks: readonly Float32Array[], sampleRate: number): number {
+  return chunks.reduce((sum, chunk) => sum + chunk.length, 0) / sampleRate;
+}
+
+/** Whether enough audio has been buffered to start (or end) a phrase's jitter buffer wait. */
+export function shouldReleaseJitterBuffer(bufferedSeconds: number, ended: boolean): boolean {
+  return ended || bufferedSeconds >= streamJitterBufferSeconds;
+}
+
 /**
- * Plays raw 16-bit mono PCM while it is still arriving. Resolves once the first audio has come
- * in, so playback can start before the phrase has finished generating; `completed` settles when
- * the whole phrase has been received.
+ * Whether playback should keep waiting for more audio instead of restarting right away after a real
+ * underrun. Restarting the instant a single small chunk arrives just causes another underrun a
+ * moment later; holding until at least `schedule.underrunLead` seconds are buffered (or the stream
+ * ended) lets the restart actually ride out the jitter that caused the underrun.
+ */
+export function shouldHoldForUnderrun(
+  schedule: StreamSchedule,
+  now: number,
+  pendingSeconds: number,
+  ended: boolean,
+): boolean {
+  return schedule.started && !ended && schedule.nextTime < now && pendingSeconds < schedule.underrunLead;
+}
+
+/**
+ * Plays raw 16-bit mono PCM while it is still arriving. Resolves once enough audio has come in (or
+ * the stream ended) to ride out ordinary network jitter, so playback can start before the phrase has
+ * finished generating without immediately running dry; `completed` settles when the whole phrase has
+ * been received.
  */
 export async function prepareAudioStream(
   body: ReadableStream<Uint8Array>,
@@ -124,7 +166,9 @@ export async function prepareAudioStream(
         if (!samples.length) continue;
         received += samples.length;
         pending.push(samples);
-        firstAudio();
+        // Jitter buffer: don't let the pipeline start playing this phrase until there's enough
+        // buffered to ride out ordinary jitter, so playback doesn't start only to underrun moments later.
+        if (shouldReleaseJitterBuffer(received / sampleRate, false)) firstAudio();
         notify();
       }
       if (!received) throw new Error("The speech server sent no audio");
@@ -143,6 +187,10 @@ export async function prepareAudioStream(
     const analyser = audio.createAnalyser();
     analyser.fftSize = 128;
     analyser.connect(destination);
+    // One gain node for the whole phrase: ramped up at the start (and after any underrun restart)
+    // and ramped down if the phrase is cut off, so restarts and cutoffs don't click.
+    const gain = audio.createGain();
+    gain.connect(analyser);
     const sources = new Set<AudioBufferSourceNode>();
     const schedule = freshStreamSchedule();
     let started = false;
@@ -153,7 +201,9 @@ export async function prepareAudioStream(
         };
         const drain = () => {
           if (signal.aborted) return;
-          if (pending.length) {
+          const now = audio.currentTime;
+          const pendingSeconds = bufferedDurationSeconds(pending, sampleRate);
+          if (pending.length && !shouldHoldForUnderrun(schedule, now, pendingSeconds, ended)) {
             // Merge whatever arrived since the last pass into one buffer, so tiny network chunks don't click.
             const length = pending.reduce((sum, part) => sum + part.length, 0);
             const buffer = audio.createBuffer(1, length, sampleRate);
@@ -162,8 +212,14 @@ export async function prepareAudioStream(
             for (const part of pending.splice(0)) { channel.set(part, offset); offset += part.length; }
             const source = audio.createBufferSource();
             source.buffer = buffer;
-            source.connect(analyser);
-            source.start(scheduleStreamChunk(schedule, audio.currentTime, buffer.duration));
+            source.connect(gain);
+            const startAt = scheduleStreamChunk(schedule, now, buffer.duration);
+            if (schedule.restarted) {
+              gain.gain.cancelScheduledValues(startAt);
+              gain.gain.setValueAtTime(0, startAt);
+              gain.gain.linearRampToValueAtTime(1, startAt + streamFadeSeconds);
+            }
+            source.start(startAt);
             sources.add(source);
             source.onended = () => {
               sources.delete(source);
@@ -180,10 +236,14 @@ export async function prepareAudioStream(
         };
         const cancel = () => {
           wake = null;
+          const now = audio.currentTime;
+          // Fade out instead of cutting the source(s) off instantly, to avoid a click.
+          gain.gain.cancelScheduledValues(now);
+          gain.gain.setValueAtTime(gain.gain.value, now);
+          gain.gain.linearRampToValueAtTime(0, now + streamFadeSeconds);
           for (const source of sources) {
             source.onended = null;
-            try { source.stop(); } catch { /* already stopped */ }
-            source.disconnect();
+            try { source.stop(now + streamFadeSeconds); } catch { /* already stopped */ }
           }
           sources.clear();
           cancelRead();
@@ -192,8 +252,15 @@ export async function prepareAudioStream(
         signal.addEventListener("abort", cancel, { once: true });
         drain();
       });
-    } finally {
+      gain.disconnect();
       analyser.disconnect();
+    } catch (error) {
+      // Let the fade-out ramp finish playing before tearing down the node graph.
+      setTimeout(() => {
+        try { gain.disconnect(); } catch { /* already disconnected */ }
+        try { analyser.disconnect(); } catch { /* already disconnected */ }
+      }, streamFadeSeconds * 1000 + 20);
+      throw error;
     }
   }) as PreparedSpeech;
   play.completed = completed;

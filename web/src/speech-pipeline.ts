@@ -87,7 +87,10 @@ export class SpeechPipeline {
       })();
     }
 
-    // Keep synthesis serial while playback runs to preserve voice continuity.
+    // At most two phrases outstanding at once (queued/playing audio plus one request in flight):
+    // the next phrase's request dispatches as soon as this one's audio starts arriving, so its
+    // round trip and the backend's first byte are paid while the previous phrase is still playing,
+    // instead of only after the previous phrase's whole stream has been downloaded.
     if (!run.generating && run.audio.length < 2 && run.text.length) {
       let text = run.text.shift()!;
       if (run.hasDispatchedSpeech) {
@@ -102,9 +105,10 @@ export class SpeechPipeline {
           const prepared = await this.synthesize(text, signal);
           if (run === this.run && !signal.aborted) {
             run.audio.push(prepared);
-            this.pump(run);
           }
-          await prepared.completed;
+          // The request stays open after this point (the rest of the phrase keeps streaming); catch
+          // a late failure without blocking the next phrase's request, already free to dispatch below.
+          prepared.completed?.catch((error) => this.fail(run, error));
         } catch (error) {
           this.fail(run, error);
         } finally {

@@ -756,6 +756,36 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   const SHORT_SPEECH_CHARS = 40;
   const SHORT_SPEECH_ENTRIES = 32;
 
+  // Some TTS backends (Breeze, and likely others) answer overlapping requests with 502s within
+  // milliseconds of each other, so at most one request per configured engine may talk to it at a
+  // time. Later phrases wait FIFO for the one already streaming; a request whose client disconnects
+  // while still queued is dropped without ever reaching the backend. Keyed by engine identity so a
+  // settings change starts a fresh queue instead of waiting behind the old one.
+  const speechQueueTails = new Map<string, Promise<void>>();
+  const speechQueueKey = () => {
+    const tts = speechSettings.get().tts;
+    return `${tts.engine}|${tts.url ?? ""}`;
+  };
+  function queueSpeech<T>(signal: AbortSignal, job: () => Promise<T>): Promise<T> {
+    const key = speechQueueKey();
+    const ahead = speechQueueTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => { release = resolve; });
+    speechQueueTails.set(key, done);
+    return ahead.then(async () => {
+      if (signal.aborted) {
+        release();
+        throw new DOMException("This operation was aborted", "AbortError");
+      }
+      try {
+        return await job();
+      } finally {
+        release();
+        if (speechQueueTails.get(key) === done) speechQueueTails.delete(key);
+      }
+    });
+  }
+
   app.post("/api/voice/speech", async (req, res) => {
     const text = readSpeechText(req.body?.text);
     if (!text) return res.status(400).json({ error: "text must contain 1–1200 characters" });
@@ -765,27 +795,30 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     const controller = abortOnDisconnect(req, res);
     // A browser that can play raw PCM gets the audio as the server generates it.
     if (req.accepts(["audio/pcm", "audio/wav"]) === "audio/pcm") {
-      let stream;
+      let streamed: boolean;
       try {
-        stream = await speech.synthesizeStream(text, requestedVoice ?? speech.defaultVoice, controller.signal);
+        // The queue holds the backend slot for the whole stream, not just until headers arrive.
+        streamed = await queueSpeech(controller.signal, async () => {
+          const stream = await speech.synthesizeStream(text, requestedVoice ?? speech.defaultVoice, controller.signal);
+          if (!stream) return false;
+          res.writeHead(200, { "Content-Type": "audio/pcm", "X-Sample-Rate": String(stream.sampleRate), "X-Sample-Format": "s16le", "Cache-Control": "no-store", "X-Accel-Buffering": "no" });
+          res.flushHeaders();
+          try {
+            for await (const chunk of stream.chunks) {
+              if (controller.signal.aborted || res.destroyed) break;
+              res.write(chunk);
+            }
+          } catch {
+            // Headers are gone; ending early tells the browser the phrase was cut short.
+          }
+          if (!res.destroyed) res.end();
+          return true;
+        });
       } catch (error) {
         if (!controller.signal.aborted && !res.destroyed) res.status(502).json({ error: messageFor(error) });
         return;
       }
-      if (stream) {
-        res.writeHead(200, { "Content-Type": "audio/pcm", "X-Sample-Rate": String(stream.sampleRate), "X-Sample-Format": "s16le", "Cache-Control": "no-store", "X-Accel-Buffering": "no" });
-        res.flushHeaders();
-        try {
-          for await (const chunk of stream.chunks) {
-            if (controller.signal.aborted || res.destroyed) break;
-            res.write(chunk);
-          }
-        } catch {
-          // Headers are gone; ending early tells the browser the phrase was cut short.
-        }
-        if (!res.destroyed) res.end();
-        return;
-      }
+      if (streamed) return;
     }
     const voice = requestedVoice ?? speech.defaultVoice;
     // Keyed by who speaks too: a joined machine may take over the hub's speech at any time.
@@ -796,7 +829,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       return;
     }
     try {
-      const wav = await speech.synthesize(text, voice, controller.signal);
+      const wav = await queueSpeech(controller.signal, () => speech.synthesize(text, voice, controller.signal));
       if (cacheKey && wav.length > 0) {
         if (shortSpeechCache.size >= SHORT_SPEECH_ENTRIES) shortSpeechCache.delete(shortSpeechCache.keys().next().value!);
         shortSpeechCache.set(cacheKey, wav);

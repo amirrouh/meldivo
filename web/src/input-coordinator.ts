@@ -1,6 +1,12 @@
 export type VoiceRecording = {
   samples: Float32Array;
   possibleEcho?: string;
+  /**
+   * Set when the interrupt/send decision for this recording could not be made at speech
+   * end (the live preview was empty or stale): the transcribe callback must classify the
+   * final transcript itself, against the played-phrase window captured at speech end.
+   */
+  pendingInterruptDecision?: { recentWindow: string; wordPathBlocked: boolean };
 };
 
 type Transcribe = (recording: VoiceRecording, signal: AbortSignal) => Promise<string>;

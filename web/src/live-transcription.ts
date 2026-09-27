@@ -12,9 +12,20 @@ type Segment = {
   pending?: Promise<void>;
   result?: { revision: number; text: string };
   endpointed: boolean;
+  /** Began while a reply was already playing: the first speculation is worth rushing (see fastSpeculationFrames). */
+  overActiveTurn: boolean;
+  /** Frame count at the moment confirm() was called, or null before that. */
+  confirmedAt: number | null;
 };
 
 export const speculativeSttGraceMs = 350;
+
+/**
+ * When a segment starts over an active reply, the first speculative request does not wait
+ * for the usual quiet-frame or two-second timeout: a barge-in decision needs a preview far
+ * sooner, so it goes out this many frames (~0.65 s of 32 ms Silero frames) after confirm.
+ */
+export const fastSpeculationFrames = 20;
 
 /** Reuse a current Whisper hypothesis when it covers the final spoken frame. */
 export class LiveTranscription {
@@ -59,19 +70,25 @@ export class LiveTranscription {
       segment.quiet++;
     }
 
+    // The very first speculation of a segment that began over an active reply is rushed:
+    // a barge-in decision cannot wait out the normal quiet/timeout schedule.
+    const dueForFastFirstSpeculation = (
+      segment.confirmed && segment.overActiveTurn && segment.requested === -1 && segment.confirmedAt !== null
+      && segment.frames.length - segment.confirmedAt >= fastSpeculationFrames
+    );
     // Refresh at a pause or about every two seconds of 32 ms Silero frames.
     if (
       segment.confirmed &&
       !segment.pending &&
       segment.requested !== segment.revision &&
-      (segment.quiet >= 6 || segment.frames.length - segment.lastRequest >= 63)
+      (dueForFastFirstSpeculation || segment.quiet >= 6 || segment.frames.length - segment.lastRequest >= 63)
     ) {
       this.speculate(segment);
     }
     this.checkEndpoint(segment);
   }
 
-  begin() {
+  begin(overActiveTurn = false) {
     const segment: Segment = {
       frames: this.preRoll,
       revision: 1,
@@ -81,6 +98,8 @@ export class LiveTranscription {
       lastRequest: 0,
       controller: new AbortController(),
       endpointed: false,
+      overActiveTurn,
+      confirmedAt: null,
     };
     this.preRoll = [];
     this.current = segment;
@@ -89,7 +108,10 @@ export class LiveTranscription {
   }
 
   confirm() {
-    if (this.current) this.current.confirmed = true;
+    if (this.current) {
+      this.current.confirmed = true;
+      this.current.confirmedAt = this.current.frames.length;
+    }
   }
 
   end(samples: Float32Array) {
