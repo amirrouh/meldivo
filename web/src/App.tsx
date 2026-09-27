@@ -327,6 +327,15 @@ export default function App({ sessionKey, folder }: AppProps) {
       if (mounted.current) setStatusText((current) => (current === warmingStatus ? "" : current));
     }
   };
+  // Silences the reply almost at once (a few ms fade, no click) when the user starts talking
+  // over it; restoreOutput brings it back if what they said turns out not to count.
+  const silenceOutput = () => {
+    const gain = outputGain.current;
+    const context = audio.current;
+    if (!gain || !context) return;
+    gain.gain.cancelScheduledValues(context.currentTime);
+    gain.gain.setTargetAtTime(0, context.currentTime, 0.01);
+  };
   const restoreOutput = () => {
     const gain = outputGain.current;
     const context = audio.current;
@@ -453,6 +462,8 @@ export default function App({ sessionKey, folder }: AppProps) {
     chat.current = null;
     pipeline.current?.cancel();
     stopMeter();
+    // A reply silenced by a barge-in is gone now; the next one plays at full volume.
+    restoreOutput();
     cueState.current = endTurn(cueState.current);
     stopCueWatcher();
     if (wasActive) {
@@ -1068,7 +1079,9 @@ export default function App({ sessionKey, folder }: AppProps) {
             return stripped;
           }
           // Not meaningful (or the acoustic gate did not trust the word path): drop it
-          // silently, exactly as a fresh-but-unmeaningful preview would have at speech end.
+          // silently, exactly as a fresh-but-unmeaningful preview would have at speech end,
+          // and let the reply be heard again.
+          restoreOutput();
           return "";
         },
         sendMessage,
@@ -1160,6 +1173,10 @@ export default function App({ sessionKey, folder }: AppProps) {
               candidateGateDecided.current = true;
               const mean = candidateGateRmsSum.current / candidateGateFrames.current;
               if (isBelowEchoFloor(mean, echoFloor.current)) bargeIn.current.blockWordPath();
+              // Clearly louder than the reply's own echo: the user is talking, so stop the reply
+              // being heard now (~a quarter second in) rather than when the words are transcribed.
+              // If they turn out to be a cough or filler, the reply comes back.
+              else if (echoFloor.current !== null) silenceOutput();
             }
           }
         },
@@ -1184,7 +1201,8 @@ export default function App({ sessionKey, folder }: AppProps) {
             syncState();
             return;
           }
-          restoreOutput();
+          // A silenced reply stays silent while its fate waits for the final transcript.
+          if (!decision.deferDecision) restoreOutput();
           if (decision.interrupt) interruptActiveTurn();
           if (!decision.send) {
             // A fresh preview said only filler, echo, or nothing, and the reply was never
