@@ -97,6 +97,8 @@ export interface MachineClientOptions {
   speech?: SpeechEngine;
   isBusy(key: string): boolean;
   runTurn(key: string, message: string, conversationId: string | undefined, cwd: string | undefined, signal: AbortSignal, sink: TurnSink): Promise<void>;
+  /** Starts warming a session in the background (see /warm). */
+  warm?(key: string): void;
 }
 
 export interface MachineClient {
@@ -252,6 +254,11 @@ export function startMachineClient(options: MachineClientOptions): MachineClient
         case "cancel":
           turns.get(message.turnId)?.abort();
           return;
+        case "warm": {
+          const harness = typeof message.key === "string" ? harnessOfKey(message.key) : undefined;
+          if (harness && allowed(harness) && !message.key.startsWith("new:")) options.warm?.(message.key);
+          return;
+        }
         case "speech":
           handleSpeech(message);
           return;

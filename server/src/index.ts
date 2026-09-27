@@ -156,6 +156,9 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     const cert = readFileSync(certPath);
     const key = readFileSync(keyPath);
     const server = createHttpsServer({ cert, key }, app);
+    // Same keep-alive as the HTTP server below: turns are a few requests seconds apart.
+    server.keepAliveTimeout = 75_000;
+    server.headersTimeout = 80_000;
     hub?.attach(server);
     await new Promise<void>((resolve, reject) => {
       server.listen(options.httpsPort ?? 4443, "0.0.0.0", () => resolve());
@@ -183,8 +186,20 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     buildUrl: (origin) => `${origin}/#token=${encodeURIComponent(secret)}`,
   });
 
+  // Stale-while-revalidate: once there is a snapshot, callers (voice turns especially) never wait
+  // for a rebuild, which can take a third of a second when a harness's availability is rechecked.
+  let refreshing: Promise<SessionsSnapshot> | undefined;
   async function getSessionsSnapshot(): Promise<SessionsSnapshot> {
     if (sessionsSnapshot && Date.now() - sessionsSnapshot.at < SESSIONS_CACHE_MS) return sessionsSnapshot;
+    refreshing ??= buildSessionsSnapshot().finally(() => { refreshing = undefined; });
+    if (sessionsSnapshot) {
+      refreshing.catch(() => undefined);
+      return sessionsSnapshot;
+    }
+    return refreshing;
+  }
+
+  async function buildSessionsSnapshot(): Promise<SessionsSnapshot> {
     const [sessions, availability, forkIds] = await Promise.all([
       listAllSessions(adapters, SESSIONS_LIMIT),
       Promise.all(adapters.map(async (adapter) => ({ id: adapter.id, label: adapter.label, available: await adapter.available() }))),
@@ -234,6 +249,11 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     const buffered: TurnEvent[] = [];
     let sawDelta = false;
     let sessionId: string | undefined;
+    // Timing only, never content: how long the agent took to start speaking, and in total.
+    const started = Date.now();
+    let firstDeltaMs: number | undefined;
+    const logTiming = (outcome: string) =>
+      logger.info("turn_timing", { harness: adapter.id, outcome, first_delta_ms: firstDeltaMs, total_ms: Date.now() - started, aborted: signal.aborted });
 
     // Persists the session/fork id (if any) *before* the terminal event
     // reaches the client, so a caller's very next request — sent the
@@ -255,7 +275,10 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
       // Every reply is spoken, so every turn asks for a short spoken answer (see voice-turn.ts).
       for await (const event of adapter.send(target, voicePrompt(message), signal)) {
         if (event.type === "session") sessionId = event.id;
-        if (event.type === "delta") sawDelta = true;
+        if (event.type === "delta") {
+          sawDelta = true;
+          firstDeltaMs ??= Date.now() - started;
+        }
 
         if (allowFallback && !sawDelta) {
           if (event.type === "error") return "failed";
@@ -268,6 +291,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
         }
 
         if (event.type === "error" || event.type === "done") {
+          logTiming(event.type);
           await endWith(event);
           return "committed";
         }
@@ -384,6 +408,8 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   // previous request ended.
   const WARM_PROMPT = "(Voice check from meldivo: the user is about to talk. Reply with only the word: ready.)";
   const warming = new Map<string, Promise<void>>();
+  const warmedAt = new Map<string, number>();
+  const WARM_REUSE_MS = 9 * 60_000;
 
   async function warmExisting(key: string, harness: HarnessId, id: string, signal: AbortSignal): Promise<void> {
     const adapter = adapterById.get(harness);
@@ -413,6 +439,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   }
 
   async function runExisting(key: string, harness: HarnessId, id: string, message: string, signal: AbortSignal, sink: TurnSink): Promise<void> {
+    warmedAt.set(key, Date.now());
     // A voice turn started while its warm-up is still reading waits for it, then reuses its cache.
     await warming.get(key)?.catch(() => undefined);
     const adapter = adapterById.get(harness);
@@ -521,24 +548,38 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     sink.end();
   });
 
-  app.post("/api/sessions/:key/warm", async (req, res) => {
-    const key = req.params.key!;
+  // Starts (or joins) the warm-up of a local session; undefined when there is nothing to warm.
+  function startWarm(key: string): Promise<void> | undefined {
     const separator = key.indexOf(":");
     const harness = key.slice(0, separator) as HarnessId;
-    const id = key.slice(separator + 1);
-    // New chats have nothing to read, and a joined machine's sessions are warmed on that machine by its own turns.
-    if (separator <= 0 || key.startsWith("@") || key.startsWith("new:") || !adapterById.has(harness)) {
-      return res.json({ warmed: false });
-    }
-    const started = Date.now();
+    // New chats have nothing to read.
+    if (separator <= 0 || key.startsWith("@") || key.startsWith("new:") || !adapterById.has(harness)) return undefined;
     let running = warming.get(key);
     if (!running) {
+      // The page warms on every open; a conversation read in the last few minutes is still warm
+      // (its agent process stays up for 10 idle minutes), so don't add another exchange to it.
+      const last = warmedAt.get(key);
+      if (last !== undefined && Date.now() - last < WARM_REUSE_MS) return Promise.resolve();
       const controller = new AbortController();
-      running = warmExisting(key, harness, id, controller.signal);
+      running = warmExisting(key, harness, key.slice(separator + 1), controller.signal);
       warming.set(key, running);
       const timer = setTimeout(() => controller.abort(), 180_000);
-      void running.finally(() => { clearTimeout(timer); warming.delete(key); }).catch(() => undefined);
+      void running
+        .then(() => { warmedAt.set(key, Date.now()); })
+        .finally(() => { clearTimeout(timer); warming.delete(key); })
+        .catch(() => undefined);
     }
+    return running;
+  }
+
+  app.post("/api/sessions/:key/warm", async (req, res) => {
+    const key = req.params.key!;
+    // A joined machine's session is warmed on that machine; its first turn waits for the warm-up there.
+    const remote = parseMachineKey(key);
+    if (remote) return res.json({ warmed: Boolean(hub?.warm(remote.name, remote.inner)) });
+    const started = Date.now();
+    const running = startWarm(key);
+    if (!running) return res.json({ warmed: false });
     try {
       await running;
       res.json({ warmed: true, ms: Date.now() - started });
@@ -588,6 +629,20 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
 
   app.delete("/api/remote", async (_req, res) => {
     await remoteManager.stop();
+    res.status(204).end();
+  });
+
+  // Durations the page measured for one voice turn (numbers only, never text).
+  app.post("/api/voice/timing", (req, res) => {
+    const fields: Record<string, number> = {};
+    for (const name of [
+      "silence_wait_ms", "speech_end_to_send_ms", "send_to_first_word_ms", "first_word_to_sound_ms", "speech_end_to_sound_ms",
+      "startup_lease_ms", "startup_microphone_ms", "startup_detector_ms", "startup_listening_ms",
+    ]) {
+      const value = req.body?.[name];
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0 && value < 600_000) fields[name] = Math.round(value);
+    }
+    logger.info("voice_timing", fields);
     res.status(204).end();
   });
 
@@ -662,6 +717,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     }
     prepareSetting(tts);
     prepareSetting(stt);
+    shortSpeechCache.clear();
     if (options.warmupSpeech) void speech.warmup?.().catch(() => undefined);
     logger.info("speech_settings_saved", { tts: tts.engine, stt: stt.engine });
     res.set("Cache-Control", "no-store").json(settingsView());
@@ -694,6 +750,12 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
     }
   });
 
+  // Short phrases fetched whole (the page's "one moment" cues, voice previews) are kept in memory,
+  // so asking again costs the speech server nothing. Cleared whenever the speech settings change.
+  const shortSpeechCache = new Map<string, Buffer>();
+  const SHORT_SPEECH_CHARS = 40;
+  const SHORT_SPEECH_ENTRIES = 32;
+
   app.post("/api/voice/speech", async (req, res) => {
     const text = readSpeechText(req.body?.text);
     if (!text) return res.status(400).json({ error: "text must contain 1–1200 characters" });
@@ -725,8 +787,20 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
         return;
       }
     }
+    const voice = requestedVoice ?? speech.defaultVoice;
+    // Keyed by who speaks too: a joined machine may take over the hub's speech at any time.
+    const cacheKey = text.length <= SHORT_SPEECH_CHARS ? JSON.stringify([hub?.speechMachine() ?? "", voice, text]) : undefined;
+    const cached = cacheKey ? shortSpeechCache.get(cacheKey) : undefined;
+    if (cached) {
+      res.status(200).set({ "Content-Type": "audio/wav", "Cache-Control": "no-store" }).send(cached);
+      return;
+    }
     try {
-      const wav = await speech.synthesize(text, requestedVoice ?? speech.defaultVoice, controller.signal);
+      const wav = await speech.synthesize(text, voice, controller.signal);
+      if (cacheKey && wav.length > 0) {
+        if (shortSpeechCache.size >= SHORT_SPEECH_ENTRIES) shortSpeechCache.delete(shortSpeechCache.keys().next().value!);
+        shortSpeechCache.set(cacheKey, wav);
+      }
       if (!controller.signal.aborted && !res.destroyed) {
         res.status(200).set({ "Content-Type": "audio/wav", "Cache-Control": "no-store" }).send(wav);
       }
@@ -736,7 +810,15 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   });
 
   if (webDir && existsSync(webDir)) {
-    app.use(express.static(webDir));
+    // Built chunks are content-hashed and the speech-detection model and runtime only change with an
+    // upgrade, so the browser may keep them; "private" still keeps them out of shared caches.
+    app.use(express.static(webDir, {
+      setHeaders: (res, file) => {
+        const relative = path.relative(webDir, file).split(path.sep).join("/");
+        if (relative.startsWith("assets/")) res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+        else if (relative.startsWith("voice-assets/")) res.setHeader("Cache-Control", "private, max-age=604800");
+      },
+    }));
     app.get("/{*path}", (req, res, next) => {
       if (req.path === "/api" || req.path.startsWith("/api/")) return next();
       res.sendFile(path.join(webDir, "index.html"));
@@ -744,9 +826,16 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   }
   app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
 
+  // A voice turn is a few requests seconds apart; keep idle connections open between turns so each
+  // request doesn't pay a new TCP/TLS handshake (Node closes them after 5 s by default).
+  const keepAlive = (server: Server | HttpsServer) => {
+    server.keepAliveTimeout = 75_000;
+    server.headersTimeout = 80_000;
+  };
   let httpServer: Server;
   await new Promise<void>((resolve, reject) => {
     httpServer = app.listen(options.port ?? 0, host, () => resolve());
+    keepAlive(httpServer);
     httpServer.once("error", reject);
   });
   hub?.attach(httpServer!);
@@ -755,6 +844,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
   for (const extraHost of options.extraHosts ?? []) {
     await new Promise<void>((resolve, reject) => {
       const extra = app.listen(actualPort, extraHost, () => resolve());
+      keepAlive(extra);
       extra.once("error", reject);
       hub?.attach(extra);
       extraServers.push(extra);
@@ -774,6 +864,7 @@ export async function startServer(options: StartServerOptions): Promise<{ port: 
         return { harnesses: snapshot.harnesses, sessions: snapshot.sessions };
       },
       isBusy: (key) => activeTurns.has(key),
+      warm: (key) => void startWarm(key)?.catch(() => undefined),
       speech: localSpeech,
       runTurn: (key, message, conversationId, cwd, signal, sink) => {
         const controller = new AbortController();

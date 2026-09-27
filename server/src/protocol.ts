@@ -36,6 +36,7 @@ export type HubMessage =
   | { type: "hello-ack"; name: string; signature: string }
   | { type: "chat"; turnId: string; key: string; message: string; conversationId?: string; cwd?: string }
   | { type: "cancel"; turnId: string }
+  | { type: "warm"; key: string }
   | { type: "speech"; requestId: string; op: "transcribe"; audio: string }
   | { type: "speech"; requestId: string; op: "synthesize"; text: string; voice: string }
   | { type: "ping" }

@@ -62,7 +62,10 @@ function phraseBoundary(text: string, done: boolean, early: boolean): number {
     if (!boundary) return 0;
     end += boundary;
     const words = plainSpeech(text.slice(0, end).replace(/—/g, " ")).match(/[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*/gu)?.length ?? 0;
-    const minWords = early ? 5 : 3;
+    // The first phrase is what the listener waits on: a finished sentence of two words ("Sure
+    // thing.") can go right away, a clause cut at a comma needs a few more to sound natural.
+    const endsSentence = /[.!?。！？]["'”’)\]]*\s*$/.test(text.slice(0, end));
+    const minWords = early ? (endsSentence ? 1 : 3) : 3;
     if (words > minWords || (done && end === text.length)) return end;
   }
   return 0;
@@ -71,7 +74,7 @@ function phraseBoundary(text: string, done: boolean, early: boolean): number {
 /**
  * Consume stable phrase boundaries once and retain the unfinished tail.
  * When `first` is set, the earliest chunk in this call is allowed to break
- * at a short clause (≈6-10 words) so the first sentence reaches TTS as soon
+ * at a short sentence (2+ words) or clause (4+ words) so speech starts as soon
  * as possible; every chunk after that reverts to full-sentence boundaries.
  */
 export function consumeSpeechChunks(text: string, done = false, first = false) {

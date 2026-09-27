@@ -2,11 +2,23 @@ import { spawn } from "node:child_process";
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { createInterface } from "node:readline";
+import { ClaudePool, type ClaudeProcess } from "./claude-warm.js";
 import { describeTool } from "./tool-activity.js";
 import type { HarnessAdapter, SendTarget, SessionInfo, TurnEvent } from "./types.js";
 
 const TAIL_BYTES = 64 * 1024;
+
+// Warm Claude Code processes of every adapter, stopped with this server.
+const pools = new Set<ClaudePool>();
+const ownPids = new Set<number>();
+process.once("exit", () => {
+  for (const pool of pools) pool.closeAll();
+});
+
+/** Stops every warm Claude Code process (tests). */
+export function _closeClaudeProcessesForTests(): void {
+  for (const pool of pools) pool.closeAll();
+}
 const HEAD_BYTES = 32 * 1024;
 
 interface ClaudeOptions {
@@ -195,7 +207,8 @@ function readOpenSessions(home: string): Map<string, OpenSessionEntry> {
         status?: string;
       };
       if (!data.sessionId) continue;
-      if (!pidAlive(pid)) continue;
+      // meldivo's own warm processes write status files too; they are not a terminal.
+      if (ownPids.has(pid) || !pidAlive(pid)) continue;
       result.set(data.sessionId, { sessionId: data.sessionId, busy: data.status === "busy" });
     } catch {
       // ignore malformed/racy status files
@@ -210,6 +223,8 @@ export function createClaudeAdapter(options: ClaudeOptions = {}): HarnessAdapter
   const projectsDir = path.join(home, ".claude", "projects");
 
   let availableCache: { value: boolean; at: number } | undefined;
+  const pool = new ClaudePool(bin);
+  pools.add(pool);
 
   async function checkAvailable(): Promise<boolean> {
     return new Promise((resolve) => {
@@ -296,138 +311,131 @@ export function createClaudeAdapter(options: ClaudeOptions = {}): HarnessAdapter
     },
 
     async *send(target: SendTarget, text: string, signal: AbortSignal): AsyncIterable<TurnEvent> {
-      const args: string[] = ["-p"];
-      if (target.id) {
-        args.push("--resume", target.id);
-        if (target.fork) args.push("--fork-session");
+      // Reuse the warm process that has this session open, unless something else wrote to it since.
+      let proc = target.fork ? undefined : pool.take(target.id, target.cwd, target.model);
+      if (proc?.changedOnDisk()) {
+        proc.close();
+        pool.forget(proc);
+        proc = undefined;
       }
-      args.push(
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-        "--permission-mode",
-        "acceptEdits",
-      );
-      if (target.model) args.push("--model", target.model);
-      args.push(text);
-
-      const child = spawn(bin, args, {
-        cwd: target.cwd,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-
-      const onAbort = () => {
-        child.kill("SIGTERM");
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-
-      let stderrTail = "";
-      child.stderr.on("data", (chunk: Buffer) => {
-        stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
-      });
-
-      const rl = createInterface({ input: child.stdout });
-      const events: TurnEvent[] = [];
-      let resolveNext: (() => void) | undefined;
-      let ended = false;
-      let exitCode: number | null = null;
-      // A clean exit with no session id or no reply text means the CLI's output format changed.
-      let sawSession = false;
-      let sawText = false;
-      let sessionEmitted = false;
-
-      rl.on("line", (line) => {
-        const trimmed = line.trim();
-        if (!trimmed) return;
-        let obj: Record<string, unknown>;
-        try {
-          obj = JSON.parse(trimmed);
-        } catch {
-          return;
+      if (!proc) {
+        const args: string[] = ["-p", "--input-format", "stream-json"];
+        if (target.id) {
+          args.push("--resume", target.id);
+          if (target.fork) args.push("--fork-session");
         }
-        const type = obj.type;
-        if (type === "system" && typeof obj.session_id === "string") {
-          if (!sessionEmitted) {
-            sessionEmitted = true;
-            sawSession = true;
-            events.push({ type: "session", id: obj.session_id });
-          }
-        } else if (type === "stream_event") {
-          const event = obj.event as Record<string, unknown> | undefined;
-          if (event?.type === "content_block_delta") {
-            const delta = event.delta as Record<string, unknown> | undefined;
-            if (delta?.type === "text_delta" && typeof delta.text === "string") {
-              sawText = true;
-              events.push({ type: "delta", text: delta.text });
-            }
-          }
-        } else if (type === "assistant") {
-          const message = obj.message as Record<string, unknown> | undefined;
-          const content = message?.content;
-          if (Array.isArray(content)) {
-            for (const block of content) {
-              if (block && typeof block === "object" && (block as Record<string, unknown>).type === "tool_use") {
-                const name = (block as Record<string, unknown>).name;
-                if (typeof name === "string") events.push({ type: "tool", name, ...describeTool(name, (block as Record<string, unknown>).input, target.cwd) });
-              }
-            }
-          }
-        } else if (type === "result") {
-          const denials = obj.permission_denials;
-          if (Array.isArray(denials) && denials.length > 0) {
-            events.push({ type: "notice", message: "a tool call was denied because no one could approve it" });
-          }
-          if (obj.is_error) {
-            const msg = typeof obj.result === "string" ? obj.result : "claude reported an error";
-            events.push({ type: "error", message: msg });
-            sawText = true; // already reported; don't also claim the format changed
-          }
+        args.push(
+          "--output-format",
+          "stream-json",
+          "--verbose",
+          "--include-partial-messages",
+          "--permission-mode",
+          "acceptEdits",
+        );
+        if (target.model) args.push("--model", target.model);
+        proc = pool.spawn(args, target.cwd, target.model);
+        const pid = proc.child.pid;
+        if (pid) {
+          ownPids.add(pid);
+          proc.onExit(() => ownPids.delete(pid));
         }
-        resolveNext?.();
-      });
-
-      const exitPromise = new Promise<void>((resolve) => {
-        child.on("close", (code) => {
-          exitCode = code;
-          ended = true;
-          resolveNext?.();
-          resolve();
-        });
-        child.on("error", (err) => {
-          stderrTail += `\n${String(err)}`;
-          exitCode = -1;
-          ended = true;
-          resolveNext?.();
-          resolve();
-        });
-      });
-
-      try {
-        while (true) {
-          while (events.length > 0) {
-            yield events.shift()!;
-          }
-          if (ended) break;
-          await new Promise<void>((resolve) => {
-            resolveNext = resolve;
-          });
-        }
-        await exitPromise;
-        while (events.length > 0) {
-          yield events.shift()!;
-        }
-        if (exitCode !== 0 && exitCode !== null) {
-          yield { type: "error", message: stderrTail.trim() || `claude exited with code ${exitCode}` };
-        }
-        if (exitCode === 0 && (!sawSession || !sawText)) {
-          yield { type: "notice", message: "Claude Code finished without a reply meldivo could read; this Claude Code version may not be supported yet, so update meldivo" };
-        }
-      } finally {
-        signal.removeEventListener("abort", onAbort);
-        rl.close();
-        yield { type: "done" };
       }
+      yield* runClaudeTurn(proc, text, target.cwd, signal);
     },
   };
+
+  /** Runs one user message on a warm Claude Code process and streams it until its "result". */
+  async function* runClaudeTurn(proc: ClaudeProcess, text: string, cwd: string, signal: AbortSignal): AsyncIterable<TurnEvent> {
+    const events: TurnEvent[] = [];
+    let wake: (() => void) | undefined;
+    let finished = false;
+    let stopped = false;
+    // A clean exit with no session id or no reply text means the CLI's output format changed.
+    let sawSession = false;
+    let sawText = false;
+    const notify = () => wake?.();
+
+    const offRecord = proc.onRecord((obj) => {
+      const type = obj.type;
+      if (type === "system" && typeof obj.session_id === "string") {
+        if (!sawSession) {
+          sawSession = true;
+          proc.learnSession(obj.session_id, projectsDir);
+          pool.register(proc);
+          events.push({ type: "session", id: obj.session_id });
+        }
+      } else if (type === "stream_event") {
+        const event = obj.event as Record<string, unknown> | undefined;
+        if (event?.type === "content_block_delta") {
+          const delta = event.delta as Record<string, unknown> | undefined;
+          if (delta?.type === "text_delta" && typeof delta.text === "string") {
+            sawText = true;
+            events.push({ type: "delta", text: delta.text });
+          }
+        }
+      } else if (type === "assistant") {
+        const message = obj.message as Record<string, unknown> | undefined;
+        const content = message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block && typeof block === "object" && (block as Record<string, unknown>).type === "tool_use") {
+              const name = (block as Record<string, unknown>).name;
+              if (typeof name === "string") events.push({ type: "tool", name, ...describeTool(name, (block as Record<string, unknown>).input, cwd) });
+            }
+          }
+        }
+      } else if (type === "result") {
+        finished = true;
+        const denials = obj.permission_denials;
+        if (Array.isArray(denials) && denials.length > 0) {
+          events.push({ type: "notice", message: "a tool call was denied because no one could approve it" });
+        }
+        if (obj.is_error && !signal.aborted) {
+          const msg = typeof obj.result === "string" ? obj.result : "claude reported an error";
+          events.push({ type: "error", message: msg });
+          sawText = true; // already reported; don't also claim the format changed
+        }
+      }
+      notify();
+    });
+    const offExit = proc.onExit(notify);
+    const onAbort = () => {
+      void proc.interrupt().finally(() => {
+        stopped = true;
+        notify();
+      });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    try {
+      proc.sendUserMessage(text);
+      while (true) {
+        while (events.length > 0) yield events.shift()!;
+        if (finished || stopped || proc.exited) break;
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+        wake = undefined;
+      }
+      while (events.length > 0) yield events.shift()!;
+      if (!signal.aborted) {
+        if (proc.exited && !finished && proc.exitCode !== 0) {
+          yield { type: "error", message: proc.stderrTail.trim() || `claude exited with code ${proc.exitCode}` };
+        } else if (!sawSession || !sawText) {
+          yield { type: "notice", message: "Claude Code finished without a reply meldivo could read; this Claude Code version may not be supported yet, so update meldivo" };
+        }
+      }
+    } finally {
+      offRecord();
+      offExit();
+      signal.removeEventListener("abort", onAbort);
+      if (!proc.exited) {
+        // A caller that stopped reading early (e.g. a warm-up that reached for a tool) must not leave Claude running.
+        if (!finished && !stopped) await proc.interrupt();
+        if (!proc.exited) proc.settle(projectsDir);
+      }
+      yield { type: "done" };
+    }
+  }
 }
+

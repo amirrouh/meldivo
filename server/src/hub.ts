@@ -86,6 +86,8 @@ export interface Hub {
   remove(name: string): boolean;
   hosts(): HostView[];
   relay(name: string, key: string, message: string, conversationId: string | undefined, cwd: string | undefined, signal: AbortSignal, sink: TurnSink): Promise<void>;
+  /** Asks a machine to warm one of its sessions (see /warm); false when it is offline. */
+  warm(name: string, key: string): boolean;
   /** A connected machine that offered to do speech for this hub, if any. */
   speechMachine(): string | undefined;
   /** Runs speech on that machine; rejects if none is connected or it fails. */
@@ -318,6 +320,12 @@ export function createHub(options: { configDir: string; logger: Logger; notFound
         machine.socket.send(JSON.stringify({ type: "chat", turnId, key, message, conversationId, cwd } satisfies HubMessage));
         if (signal.aborted) onAbort();
       });
+    },
+    warm(name, key) {
+      const machine = live.get(name);
+      if (!machine || machine.socket.readyState !== machine.socket.OPEN) return false;
+      machine.socket.send(JSON.stringify({ type: "warm", key } satisfies HubMessage));
+      return true;
     },
     speechMachine,
     speech(request, signal) {

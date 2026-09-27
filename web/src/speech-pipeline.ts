@@ -2,6 +2,10 @@ export type PreparedSpeech = ((signal: AbortSignal) => Promise<void>) & {
   completed?: Promise<void>;
 };
 
+// Queued phrases are merged into one TTS request up to this length. Each new request waits for
+// the speech server's first audio again, but a very long one can generate slower than it plays.
+export const maxMergedSpeechChars = 300;
+
 type Run = {
   controller: AbortController;
   text: string[];
@@ -87,7 +91,7 @@ export class SpeechPipeline {
     if (!run.generating && run.audio.length < 2 && run.text.length) {
       let text = run.text.shift()!;
       if (run.hasDispatchedSpeech) {
-        while (run.text.length && text.length + run.text[0].length + 1 <= 600) {
+        while (run.text.length && text.length + run.text[0].length + 1 <= maxMergedSpeechChars) {
           text += ` ${run.text.shift()!}`;
         }
       }

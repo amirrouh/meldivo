@@ -1,3 +1,6 @@
+import { shouldEndpointEarly } from "./endpointing";
+import { vadPositiveSpeechThreshold } from "./vad-config";
+
 type Segment = {
   frames: Float32Array[];
   revision: number;
@@ -8,6 +11,7 @@ type Segment = {
   controller: AbortController;
   pending?: Promise<void>;
   result?: { revision: number; text: string };
+  endpointed: boolean;
 };
 
 export const speculativeSttGraceMs = 350;
@@ -20,13 +24,22 @@ export class LiveTranscription {
   private ended = new WeakMap<Float32Array, Segment>();
   private request: (samples: Float32Array, signal: AbortSignal) => Promise<string>;
   private preview: (text: string) => void;
+  private endpoint: () => void;
+  /**
+   * A frame at or above this probability is new speech and invalidates the current hypothesis.
+   * It must match the level at which the detector itself extends speech: Silero's positive
+   * threshold, or the energy fallback's negative threshold (which keeps its segment alive).
+   */
+  speechThreshold = vadPositiveSpeechThreshold;
 
   constructor(
     request: (samples: Float32Array, signal: AbortSignal) => Promise<string>,
     preview: (text: string) => void,
+    endpoint: () => void = () => {},
   ) {
     this.request = request;
     this.preview = preview;
+    this.endpoint = endpoint;
   }
 
   frame(probability: number, samples: Float32Array) {
@@ -39,7 +52,7 @@ export class LiveTranscription {
     }
 
     segment.frames.push(frame);
-    if (probability >= 0.35) {
+    if (probability >= this.speechThreshold) {
       segment.revision++;
       segment.quiet = 0;
     } else {
@@ -55,6 +68,7 @@ export class LiveTranscription {
     ) {
       this.speculate(segment);
     }
+    this.checkEndpoint(segment);
   }
 
   begin() {
@@ -66,6 +80,7 @@ export class LiveTranscription {
       requested: -1,
       lastRequest: 0,
       controller: new AbortController(),
+      endpointed: false,
     };
     this.preRoll = [];
     this.current = segment;
@@ -136,6 +151,20 @@ export class LiveTranscription {
     return samples;
   }
 
+  // Asks the caller, once per segment, to end the utterance now: the current hypothesis is a
+  // finished sentence covering all speech so far, and the user has paused long enough.
+  private checkEndpoint(segment: Segment) {
+    if (segment.endpointed || this.current !== segment || !segment.confirmed) return;
+    if (!shouldEndpointEarly({
+      text: segment.result?.text,
+      resultRevision: segment.result?.revision,
+      revision: segment.revision,
+      quietFrames: segment.quiet,
+    })) return;
+    segment.endpointed = true;
+    this.endpoint();
+  }
+
   private speculate(segment: Segment) {
     const revision = segment.revision;
     segment.requested = revision;
@@ -144,7 +173,10 @@ export class LiveTranscription {
       .then((text) => {
         if (segment.controller.signal.aborted) return;
         segment.result = { revision, text };
-        if (this.current === segment) this.preview(text);
+        if (this.current === segment) {
+          this.preview(text);
+          this.checkEndpoint(segment);
+        }
       })
       .catch(() => {
         // The authoritative request at speech end retries a failed preview.

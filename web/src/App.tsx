@@ -3,11 +3,18 @@ import type { MicVAD } from "@ricky0123/vad-web";
 import { removeAssistantEcho } from "./assistant-echo";
 import { isCurrentVoiceSession, SerializedVadTransitions, VoiceInputCoordinator } from "./input-coordinator";
 import { LiveTranscription } from "./live-transcription";
-import { BargeInGuard } from "./barge-in-guard";
+import { BargeInGuard, meaningfulSpeechMs } from "./barge-in-guard";
 import { prepareAudioBuffer, prepareAudioStream } from "./audio-playback";
 import { SpeechPipeline, type PreparedSpeech } from "./speech-pipeline";
-import { vadOptions } from "./vad-config";
+import {
+  vadNegativeSpeechThreshold, vadOptionsFor, vadPositiveSpeechThreshold, vadRedemptionMsMax, vadRedemptionMsMin, vadRedemptionMsStep,
+} from "./vad-config";
+import { loadVadModule, preloadVoiceDetector, voiceAssetBase } from "./vad-preload";
+import { readVadRedemptionMs, writeVadRedemptionMs } from "./vad-preference";
 import { EnergyVad } from "./energy-vad";
+import {
+  beginTurn, cueIdlePollMs, cuePhrases, cueSynthesisDelayMs, dueForCue, endTurn, freshCueState, noteCuePlayed, noteSpoken, pickCue,
+} from "./working-cues";
 
 // A detector is either the real Silero MicVAD or the energy-based fallback;
 // both implement the same start/pause/destroy/setOptions + callback contract.
@@ -114,6 +121,15 @@ class VoiceOwnershipError extends Error {
   }
 }
 
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const timer = window.setTimeout(() => { signal.removeEventListener("abort", cancel); resolve(); }, ms);
+    const cancel = () => { window.clearTimeout(timer); reject(signal.reason); };
+    signal.addEventListener("abort", cancel, { once: true });
+  });
+}
+
 async function streamTurnEvents(response: Response, onEvent: (event: TurnEvent) => void) {
   if (!response.body) throw new Error("Chat response was empty.");
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -177,6 +193,17 @@ export default function App({ sessionKey, folder }: AppProps) {
   const echoReference = useRef("");
   const ownership = useRef<VoiceOwnership | null>(null);
   const bargeIn = useRef(new BargeInGuard());
+  const partialTranscript = useRef("");
+  const interruptTimer = useRef<number | null>(null);
+  const cueState = useRef(freshCueState());
+  const cueAudioCache = useRef(new Map<string, AudioBuffer>());
+  const cueController = useRef<AbortController | null>(null);
+  const cueWatcher = useRef<number | null>(null);
+  const cueSynthesis = useRef<AbortController | null>(null);
+  const cueFetch = useRef<AbortController | null>(null);
+  const lastPipelineActivity = useRef(0);
+  // What the listener feels, per turn: from the end of their speech to the first word they hear.
+  const turnTiming = useRef<{ speechEnd?: number; sent?: number; firstDelta?: number; reported?: boolean }>({});
   const turnVoice = useRef<string>();
   const [contextMenu, setContextMenu] = useState<ContextMenuPosition | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -184,6 +211,7 @@ export default function App({ sessionKey, folder }: AppProps) {
   const [profileVoice, setProfileVoice] = useState("");
   const [selectedVoice, setSelectedVoice] = useState(() => readVoicePreference() ?? "");
   const [savedVoice, setSavedVoice] = useState(() => readVoicePreference() ?? "");
+  const [vadRedemptionMs, setVadRedemptionMs] = useState(() => readVadRedemptionMs());
   const [speechHealth, setSpeechHealth] = useState<SpeechHealth>({ ready: true, downloading: false });
   const [sessionDisplay, setSessionDisplay] = useState<SessionDisplay>(() => {
     const display = deriveSessionDisplay(sessionKey);
@@ -216,6 +244,16 @@ export default function App({ sessionKey, folder }: AppProps) {
     if (acceptedWatchdog.current !== null) window.clearTimeout(acceptedWatchdog.current);
     acceptedWatchdog.current = null;
   };
+  const clearInterruptTimer = () => {
+    if (interruptTimer.current !== null) window.clearTimeout(interruptTimer.current);
+    interruptTimer.current = null;
+  };
+  const stopCueWatcher = () => {
+    if (cueWatcher.current !== null) window.clearInterval(cueWatcher.current);
+    cueWatcher.current = null;
+    cueController.current?.abort();
+    cueController.current = null;
+  };
 
   const updateState = (next: VoiceState) => {
     stateRef.current = next;
@@ -247,35 +285,29 @@ export default function App({ sessionKey, folder }: AppProps) {
     if (speaking.current) updateState("speaking");
     else if (pipeline.current?.busy && stateRef.current === "speaking") updateState("speaking");
     else if (chat.current || pipeline.current?.busy || input.current?.busy) updateState(harnessTurnActive.current ? "running" : "thinking");
-    else if (warming.current) updateState("loading");
     else if (started.current) updateState("listening");
   };
   // Has the agent's model read the whole conversation before the user speaks, so the first
-  // reply only has to read the new sentence. The server runs it on a throwaway fork.
+  // reply only has to read the new sentence. The server runs it on a throwaway fork. Started
+  // at page load; the microphone works meanwhile (the server holds the first turn until the
+  // warm-up is done), so it never shows a loading state.
   const warming = useRef(false);
+  const warmingStatus = "Reading the conversation…";
   const warmConversation = async () => {
     const key = liveKey.current;
     const { inner } = splitHostKey(key);
     if (warming.current || !inner.includes(":") || inner.startsWith("new:")) return;
     warming.current = true;
-    setStatusText("Reading the conversation…");
-    syncState();
+    setStatusText(warmingStatus);
     try {
       await fetch(`/api/sessions/${encodeURIComponent(key)}/warm`, { method: "POST", headers: authHeaders() });
     } catch {
       // The first turn is just slower; nothing to report.
     } finally {
       warming.current = false;
-      if (mounted.current) setStatusText("");
-      syncState();
+      // A turn may have replaced the status line meanwhile; only clear our own.
+      if (mounted.current) setStatusText((current) => (current === warmingStatus ? "" : current));
     }
-  };
-  const duckOutput = () => {
-    const gain = outputGain.current;
-    const context = audio.current;
-    if (!gain || !context) return;
-    gain.gain.cancelScheduledValues(context.currentTime);
-    gain.gain.setTargetAtTime(0.01, context.currentTime, 0.015);
   };
   const restoreOutput = () => {
     const gain = outputGain.current;
@@ -283,6 +315,99 @@ export default function App({ sessionKey, folder }: AppProps) {
     if (!gain || !context) return;
     gain.gain.cancelScheduledValues(context.currentTime);
     gain.gain.setTargetAtTime(1, context.currentTime, 0.015);
+  };
+  // Something the user is part of is under way (heard, transcribed, answered or spoken);
+  // cue synthesis must not compete with it for the speech server.
+  const turnInProgress = () => (
+    Boolean(chat.current) || Boolean(pipeline.current?.busy) || speaking.current
+    || Boolean(input.current?.busy) || stateRef.current === "hearing"
+  );
+  // Fetches and decodes every working-cue phrase once so a cue can play instantly
+  // later, from cache, instead of paying TTS latency right when it is needed. Starts a
+  // few seconds after listening begins and only runs between turns, so it never delays a reply.
+  const synthesizeCues = async (context: AudioContext) => {
+    cueSynthesis.current?.abort();
+    cueFetch.current?.abort();
+    const run = new AbortController();
+    cueSynthesis.current = run;
+    cueAudioCache.current.clear();
+    const voice = readVoicePreference();
+    const current = () => audio.current === context && !run.signal.aborted;
+    try {
+      await abortableDelay(cueSynthesisDelayMs, run.signal);
+      // One at a time: a speech server may refuse several requests at once.
+      for (const phrase of cuePhrases) {
+        while (current()) {
+          while (current() && turnInProgress()) await abortableDelay(cueIdlePollMs, run.signal);
+          if (!current()) return;
+          const request = new AbortController();
+          cueFetch.current = request;
+          try {
+            const response = await fetch("/api/voice/speech", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Accept: "audio/wav", ...authHeaders() },
+              body: JSON.stringify({ text: phrase, ...(voice ? { voice } : {}) }),
+              signal: request.signal,
+            });
+            if (!current() || !response.ok) break;
+            const bytes = await response.arrayBuffer();
+            if (!current()) return;
+            const buffer = await context.decodeAudioData(bytes);
+            if (current()) cueAudioCache.current.set(phrase, buffer);
+            break;
+          } catch {
+            // A turn that starts aborts the request; retry this phrase once it is over.
+            // Any other failure skips the cue: cues are polish, not required.
+            if (!request.signal.aborted) break;
+          } finally {
+            if (cueFetch.current === request) cueFetch.current = null;
+          }
+        }
+      }
+    } catch {
+      // Superseded by a newer synthesis (voice change or new session).
+    } finally {
+      if (cueSynthesis.current === run) cueSynthesis.current = null;
+    }
+  };
+  const playWorkingCue = async (text: string, signal: AbortSignal) => {
+    const context = audio.current;
+    const buffer = cueAudioCache.current.get(text);
+    if (!context || !buffer) return;
+    const playback = Symbol("cue");
+    // Set for echo removal exactly like a real reply, so a barge-in over a cue works.
+    const priorAssistantAudio = assistantAudio.current;
+    assistantAudio.current = text;
+    const prepared = prepareAudioBuffer(buffer, context, outputGain.current ?? context.destination, (analyser) => startMeter(analyser, playback));
+    try {
+      await prepared(signal);
+    } catch {
+      // Cancelled by real speech starting, a barge-in, or the turn ending.
+    } finally {
+      stopMeter(playback);
+      if (assistantAudio.current === text) assistantAudio.current = priorAssistantAudio;
+      syncState();
+    }
+  };
+  // While a turn is active and nothing is playing or queued in the speech pipeline,
+  // speaks a short filler cue so the user knows the assistant is still working.
+  const armCueWatcher = () => {
+    stopCueWatcher();
+    cueWatcher.current = window.setInterval(() => {
+      if (!cueState.current.turnActive) { stopCueWatcher(); return; }
+      if (speaking.current || pipeline.current?.busy || cueController.current) return;
+      const now = Date.now();
+      const silentForMs = now - lastPipelineActivity.current;
+      if (!dueForCue(cueState.current, silentForMs, now)) return;
+      const text = pickCue(cueState.current);
+      cueState.current = noteCuePlayed(cueState.current, text, now);
+      const controller = new AbortController();
+      cueController.current = controller;
+      void playWorkingCue(text, controller.signal).finally(() => {
+        if (cueController.current === controller) cueController.current = null;
+        lastPipelineActivity.current = Date.now();
+      });
+    }, 300);
   };
   const report = (message: string) => {
     if (!mounted.current) return;
@@ -309,6 +434,8 @@ export default function App({ sessionKey, folder }: AppProps) {
     chat.current = null;
     pipeline.current?.cancel();
     stopMeter();
+    cueState.current = endTurn(cueState.current);
+    stopCueWatcher();
     if (wasActive) {
       const key = activeChatKey.current ?? liveKey.current;
       void fetch(`/api/sessions/${encodeURIComponent(key)}/cancel`, {
@@ -334,6 +461,8 @@ export default function App({ sessionKey, folder }: AppProps) {
     abortTurn();
     restoreOutput();
     bargeIn.current.reset();
+    clearInterruptTimer();
+    partialTranscript.current = "";
     transcription.current?.reset();
     transcription.current = null;
     input.current?.reset();
@@ -368,6 +497,8 @@ export default function App({ sessionKey, folder }: AppProps) {
     abortTurn();
     restoreOutput();
     bargeIn.current.reset();
+    clearInterruptTimer();
+    partialTranscript.current = "";
     transcription.current?.reset();
     transcription.current = null;
     input.current?.reset();
@@ -400,12 +531,35 @@ export default function App({ sessionKey, folder }: AppProps) {
     return String(result.text ?? "").trim();
   };
 
+  // Sends one turn's durations (never any text) to the server log, once, when its first word plays.
+  const reportTurnTiming = () => {
+    const timing = turnTiming.current;
+    if (timing.reported || timing.sent === undefined) return;
+    timing.reported = true;
+    const now = performance.now();
+    const ms = (from?: number, to?: number) => (from === undefined || to === undefined ? undefined : Math.round(to - from));
+    void fetch("/api/voice/timing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({
+        silence_wait_ms: vad.current ? readVadRedemptionMs() : undefined,
+        speech_end_to_send_ms: ms(timing.speechEnd, timing.sent),
+        send_to_first_word_ms: ms(timing.sent, timing.firstDelta),
+        first_word_to_sound_ms: ms(timing.firstDelta, now),
+        speech_end_to_sound_ms: ms(timing.speechEnd, now),
+      }),
+    }).catch(() => undefined);
+  };
   const synthesize = async (text: string, signal: AbortSignal): Promise<PreparedSpeech> => {
     const context = audio.current;
     if (!context) throw new Error("Audio output is not ready.");
     const playback = Symbol("playback");
     const playbackStarted = (analyser: AnalyserNode) => {
-      assistantAudio.current = text.trim();
+      // The real reply wins over a working cue that happens to still be playing.
+      cueController.current?.abort();
+      reportTurnTiming();
+      // Everything said this turn, so echo of an earlier sentence is recognized too.
+      assistantAudio.current = `${assistantAudio.current} ${text.trim()}`.trim().slice(-2000);
       startMeter(analyser, playback);
     };
     const response = await fetch("/api/voice/speech", {
@@ -582,6 +736,15 @@ export default function App({ sessionKey, folder }: AppProps) {
     setSavedVoice(selectedVoice);
     setVoiceError("");
     setVoiceNotice(`${friendlyLabel(selectedVoice)} will be used from the next reply.`);
+    if (audio.current) void synthesizeCues(audio.current);
+  };
+
+  const changeVadRedemption = (value: number) => {
+    const clamped = writeVadRedemptionMs(value);
+    setVadRedemptionMs(clamped);
+    // Applies immediately to whichever detector (Silero or the energy fallback) is
+    // currently running, without needing to stop and restart the microphone.
+    vad.current?.setOptions({ redemptionMs: clamped });
   };
 
   const resetVoice = () => {
@@ -590,6 +753,7 @@ export default function App({ sessionKey, folder }: AppProps) {
     setSelectedVoice(profileVoice);
     setVoiceError("");
     setVoiceNotice(`${profileVoice ? friendlyLabel(profileVoice) : "The profile default"} will be used from the next reply.`);
+    if (audio.current) void synthesizeCues(audio.current);
   };
 
   const pauseMicrophoneForSettings = async () => {
@@ -599,6 +763,8 @@ export default function App({ sessionKey, folder }: AppProps) {
     settingsMicPaused.current = true;
     clearAcceptedWatchdog();
     bargeIn.current.reset();
+    clearInterruptTimer();
+    partialTranscript.current = "";
     echoReference.current = "";
     transcription.current?.reset();
     input.current?.reset();
@@ -663,10 +829,25 @@ export default function App({ sessionKey, folder }: AppProps) {
   const sendMessage = async (message: string) => {
     const id = ++generation.current;
     let spoken = false;
+    // The phrase right after a tool call gets the early clause boundary again,
+    // the same latency break normally reserved for the very first phrase of a turn.
+    let earlyAfterTool = false;
     const controller = new AbortController();
     chat.current = controller;
+    // The reply gets the speech server to itself; a cue being made is fetched again later.
+    cueFetch.current?.abort();
     turnVoice.current = readVoicePreference();
+    turnTiming.current = { speechEnd: turnTiming.current.speechEnd, sent: performance.now() };
     updateState("thinking");
+    cueState.current = beginTurn(cueState.current);
+    lastPipelineActivity.current = Date.now();
+    armCueWatcher();
+    const noteEnqueued = () => {
+      spoken = true;
+      earlyAfterTool = false;
+      cueState.current = noteSpoken(cueState.current);
+      lastPipelineActivity.current = Date.now();
+    };
     try {
       if (!message || id !== generation.current) { syncState(); return; }
       assistantAudio.current = "";
@@ -692,33 +873,48 @@ export default function App({ sessionKey, folder }: AppProps) {
             return;
           case "status":
             harnessTurnActive.current = true;
-            updateState("running");
+            syncState();
             setStatusText(event.message);
             return;
-          case "tool":
+          case "tool": {
             harnessTurnActive.current = true;
-            updateState("running");
+            syncState();
             setStatusText("");
             toolActivity.push(event);
+            lastPipelineActivity.current = Date.now();
+            // A tool call must not hold back text that already arrived (e.g. "Let me
+            // check that."): flush it now as a final chunk instead of waiting for the
+            // sentence to be completed by text that only streams in after the tool runs.
+            if (pending.trim()) {
+              const flushed = consumeSpeechChunks(pending, true, !spoken || earlyAfterTool);
+              pending = flushed.rest;
+              if (flushed.chunks.length) {
+                noteEnqueued();
+                pipeline.current?.enqueue(flushed.chunks);
+              }
+            }
+            earlyAfterTool = true;
             return;
+          }
           case "delta": {
+            turnTiming.current.firstDelta ??= performance.now();
             if (harnessTurnActive.current) {
               harnessTurnActive.current = false;
-              updateState("thinking");
+              syncState();
             }
             toolActivity.clear();
             pending += event.text;
-            const result = consumeSpeechChunks(pending, false, !spoken);
+            const result = consumeSpeechChunks(pending, false, !spoken || earlyAfterTool);
             pending = result.rest;
             if (result.chunks.length) {
-              spoken = true;
+              noteEnqueued();
               pipeline.current?.enqueue(result.chunks);
             }
             return;
           }
           case "notice":
             setStatusText(event.message);
-            spoken = true;
+            noteEnqueued();
             pipeline.current?.enqueue([event.message]);
             return;
           case "error":
@@ -728,9 +924,9 @@ export default function App({ sessionKey, folder }: AppProps) {
         }
       });
       if (id === generation.current) {
-        const final = consumeSpeechChunks(pending, true, !spoken);
+        const final = consumeSpeechChunks(pending, true, !spoken || earlyAfterTool);
         if (final.chunks.length) {
-          spoken = true;
+          noteEnqueued();
           pipeline.current?.enqueue(final.chunks);
         }
       }
@@ -755,6 +951,10 @@ export default function App({ sessionKey, folder }: AppProps) {
         setStatusText("");
         toolActivity.clear();
       }
+      if (id === generation.current) {
+        cueState.current = endTurn(cueState.current);
+        stopCueWatcher();
+      }
       syncState();
     }
   };
@@ -778,17 +978,37 @@ export default function App({ sessionKey, folder }: AppProps) {
       }
     };
     vadTransitions.current.beginSession();
+    // How long each startup step takes, reported once voice is listening (durations only).
+    const startupAt = performance.now();
+    const startupSteps: Record<string, number> = {};
+    const markStartup = (name: string) => { startupSteps[name] = Math.round(performance.now() - startupAt); };
+    // Set once startup fails, so a lease, microphone or detector that arrives afterwards
+    // from a still-running parallel step is released instead of leaking.
+    let abandoned = false;
     try {
       if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access requires HTTPS or localhost.");
-      acquired = await acquireVoiceOwnership(handleOwnershipLost);
-      if (!acquired) throw new VoiceOwnershipError();
-      ensureCurrentStartup();
       setError("");
       setUsingFallbackVad(false);
       updateState("thinking");
+      // Created and resumed right in the tap, while the browser still counts it as a user gesture.
       context = new AudioContext();
-      await context.resume();
-      ensureCurrentStartup();
+      const startupContext = context;
+      // The lease, the microphone and the Silero model don't depend on each other: run them
+      // together, so startup takes as long as the slowest instead of the sum of all three.
+      const leaseStep = acquireVoiceOwnership(handleOwnershipLost).then((lease) => {
+        if (abandoned) { lease?.release(); return null; }
+        acquired = lease;
+        markStartup("startup_lease_ms");
+        return lease;
+      });
+      const microphoneStep = navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      }).then((media) => {
+        if (abandoned) { media.getTracks().forEach((track) => track.stop()); return null; }
+        microphone = media;
+        markStartup("startup_microphone_ms");
+        return media;
+      });
       output = context.createGain();
       output.gain.value = 1;
       output.connect(context.destination);
@@ -796,7 +1016,10 @@ export default function App({ sessionKey, folder }: AppProps) {
         stopMeter();
         report(caught instanceof Error ? caught.message : "Speech playback failed.");
       });
-      nextTranscription = new LiveTranscription(transcribe, () => {});
+      nextTranscription = new LiveTranscription(transcribe, (text) => {
+        partialTranscript.current = text;
+        checkInterrupt(detector, session);
+      }, () => endUtteranceEarly(detector, session));
       nextInput = new VoiceInputCoordinator(
         async (recording, signal) => {
           const transcript = await (nextTranscription?.finish(recording.samples, signal) ?? transcribe(recording.samples, signal));
@@ -806,35 +1029,46 @@ export default function App({ sessionKey, folder }: AppProps) {
         (caught) => report(caught instanceof Error ? caught.message : "Voice transcription failed."),
         syncState,
       );
-      microphone = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      ensureCurrentStartup();
-      const activeMicrophone = microphone;
+      // The detector only asks for the stream when it is started, which happens after the
+      // microphone step has finished, so it can be built while permission is still pending.
+      const currentMicrophone = async () => {
+        if (!microphone) throw new Error("The microphone is not ready.");
+        return microphone;
+      };
       // Both detectors drive this exact same callback contract, so it is
       // built once and shared regardless of which one ends up running.
       const detectorCallbacks = {
-        getStream: async () => activeMicrophone, pauseStream: async () => {}, resumeStream: async () => activeMicrophone,
-        ...vadOptions,
+        getStream: currentMicrophone, pauseStream: async () => {}, resumeStream: currentMicrophone,
+        ...vadOptionsFor(readVadRedemptionMs()),
         submitUserSpeechOnPause: true,
         onSpeechStart: () => {
           if (!isCurrentVad(detector, session)) return;
           input.current?.speechStarted();
           const activeTurn = hasActiveVoiceTurn(Boolean(chat.current), Boolean(pipeline.current?.busy), speaking.current);
           const decision = bargeIn.current.speechStart(activeTurn);
-          echoReference.current = speaking.current ? assistantAudio.current : "";
+          echoReference.current = speaking.current || pipeline.current?.busy ? assistantAudio.current : "";
+          partialTranscript.current = "";
           if (decision.begin) transcription.current?.begin();
-          if (decision.duck) duckOutput();
+          // No ducking: the mic often hears the reply itself, and dipping on every such blip made the
+          // reply's volume pulse. A real interruption stops the reply once words are heard instead.
           armAcceptedWatchdog(detector, session);
+          // A candidate that turns into accepted, active-turn speech interrupts the
+          // reply once it has run this long, even if the transcript never fills in.
+          clearInterruptTimer();
+          if (activeTurn) interruptTimer.current = window.setTimeout(() => checkInterrupt(detector, session), meaningfulSpeechMs);
         },
         onSpeechRealStart: () => {
           if (!isCurrentVad(detector, session)) return;
           const decision = bargeIn.current.speechRealStart();
           if (decision.accepted) {
-            if (decision.interrupt) interruptActiveTurn();
+            // Full volume again once speech is confirmed: the mic often hears the reply itself, and
+            // holding it quiet until the transcript is judged cut out whole pieces of the reply.
+            // It still stops as soon as real words are heard (see checkInterrupt).
             restoreOutput();
             transcription.current?.confirm();
             armAcceptedWatchdog(detector, session);
+            // A turn is starting: a cue being made waits until it is over.
+            cueFetch.current?.abort();
             setError("");
             updateState("hearing");
           }
@@ -843,6 +1077,8 @@ export default function App({ sessionKey, folder }: AppProps) {
           if (!isCurrentVad(detector, session)) return;
           clearAcceptedWatchdog();
           bargeIn.current.reset();
+          clearInterruptTimer();
+          partialTranscript.current = "";
           echoReference.current = "";
           transcription.current?.discard();
           input.current?.speechDiscarded();
@@ -856,8 +1092,12 @@ export default function App({ sessionKey, folder }: AppProps) {
         },
         onSpeechEnd: (samples: Float32Array) => {
           if (!isCurrentVad(detector, session)) return;
+          turnTiming.current = { speechEnd: performance.now() };
           clearAcceptedWatchdog();
-          if (!bargeIn.current.speechEnd()) {
+          clearInterruptTimer();
+          const decision = bargeIn.current.speechEnd(partialTranscript.current, echoReference.current);
+          partialTranscript.current = "";
+          if (!decision.accepted) {
             echoReference.current = "";
             transcription.current?.discard();
             input.current?.speechDiscarded();
@@ -866,40 +1106,69 @@ export default function App({ sessionKey, folder }: AppProps) {
             return;
           }
           restoreOutput();
+          if (decision.interrupt) interruptActiveTurn();
+          if (!decision.send) {
+            // Only filler, echo, or nothing was heard, and the reply was never
+            // interrupted: let it keep playing and drop this recording.
+            echoReference.current = "";
+            transcription.current?.discard();
+            input.current?.speechDiscarded();
+            syncState();
+            return;
+          }
           transcription.current?.end(samples);
           const possibleEcho = echoReference.current;
           echoReference.current = "";
           input.current?.speechEnded({ samples, possibleEcho });
         },
       };
-      let fallbackActive = false;
-      if (!sileroInitFailed) {
+      // Loading the model does not touch the microphone (`startOnLoad: false`); the module and
+      // its assets are usually already cached by the page-load preload.
+      const sileroStep: Promise<Detector | null> = sileroInitFailed ? Promise.resolve(null) : (async () => {
         try {
-          const { MicVAD } = await import("@ricky0123/vad-web");
-          ensureCurrentStartup();
-          detector = await MicVAD.new({
-            model: "v5", audioContext: context, startOnLoad: false,
-            baseAssetPath: "/voice-assets/", onnxWASMBasePath: "/voice-assets/",
+          const { MicVAD } = await loadVadModule();
+          const loaded = await MicVAD.new({
+            model: "v5", audioContext: startupContext, startOnLoad: false,
+            baseAssetPath: voiceAssetBase, onnxWASMBasePath: voiceAssetBase,
             ortConfig: (ort) => { ort.env.wasm.numThreads = 1; },
             ...detectorCallbacks,
           });
-        } catch (caught) {
-          if (caught instanceof DOMException && caught.name === "AbortError") throw caught;
+          if (abandoned) { void loaded.destroy().catch(() => undefined); return null; }
+          detector = loaded;
+          markStartup("startup_detector_ms");
+          return loaded;
+        } catch {
           // Silero/onnxruntime-web cannot recover in-page once it has failed
           // to initialize (e.g. wedged wasm backend after many reloads).
           // Remember that for the rest of the page and go straight to the
           // energy-based fallback on this and every future start().
           sileroInitFailed = true;
-          detector = null;
+          return null;
         }
-      }
+      })();
+      const [lease, activeMicrophone, sileroDetector] = await Promise.all([
+        leaseStep, microphoneStep, sileroStep, startupContext.resume(),
+      ]);
+      // Reassigned here as well so the failure cleanup below sees what the steps produced.
+      acquired = lease;
+      microphone = activeMicrophone;
+      detector = sileroDetector;
+      if (!acquired) throw new VoiceOwnershipError();
+      if (!activeMicrophone) throw new Error("Voice startup did not finish.");
+      ensureCurrentStartup();
+      let fallbackActive = false;
       if (!detector) {
         fallbackActive = true;
         detector = await EnergyVad.new({ audioContext: context, ...detectorCallbacks });
+        markStartup("startup_detector_ms");
       }
       ensureCurrentStartup();
+      // A frame at this level keeps the running detector's segment alive, so it is also
+      // what makes a live transcript stale.
+      nextTranscription.speechThreshold = fallbackActive ? vadNegativeSpeechThreshold : vadPositiveSpeechThreshold;
       setUsingFallbackVad(fallbackActive);
       await vadTransitions.current.start(detector);
+      markStartup("startup_listening_ms");
       ensureCurrentStartup();
       const activeDetector = detector;
       const activeContext = context;
@@ -907,6 +1176,7 @@ export default function App({ sessionKey, folder }: AppProps) {
       ownership.current = acquired;
       audio.current = activeContext;
       outputGain.current = output;
+      void synthesizeCues(activeContext);
       pipeline.current = nextPipeline;
       transcription.current = nextTranscription;
       input.current = nextInput;
@@ -925,6 +1195,8 @@ export default function App({ sessionKey, folder }: AppProps) {
         abortTurn();
         restoreOutput();
         bargeIn.current.reset();
+        clearInterruptTimer();
+        partialTranscript.current = "";
         pipeline.current = null;
         transcription.current?.reset();
         transcription.current = null;
@@ -976,9 +1248,14 @@ export default function App({ sessionKey, folder }: AppProps) {
         return;
       }
       updateState("listening");
+      void fetch("/api/voice/timing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify(startupSteps),
+      }).catch(() => undefined);
       if (settingsOpenRef.current) void pauseMicrophoneForSettings();
-      await warmConversation();
     } catch (caught) {
+      abandoned = true;
       const currentStartup = sessionEpoch.current === session && startupGeneration.current === startup;
       if (currentStartup) {
         sessionEpoch.current++;
@@ -1059,6 +1336,33 @@ export default function App({ sessionKey, folder }: AppProps) {
     }, acceptedSpeechWatchdogMs);
   };
 
+  // The live transcript already reads as a finished sentence and the user has paused briefly:
+  // end the utterance now with vad-web's pause flush (which delivers onSpeechEnd with the
+  // buffered audio) instead of waiting out the whole redemption window.
+  const endUtteranceEarly = (candidate: Detector | null, session: number) => {
+    if (!candidate || !isCurrentVad(candidate, session)) return;
+    void vadTransitions.current.flush(candidate).catch((caught) => {
+      if (!ownsCurrentVad(candidate, false, session)) return;
+      if (vadTransitions.current.isInvalid(candidate)) {
+        deactivateVoice("Microphone transition timed out. Tap the shape to reconnect.");
+      } else {
+        report(caught instanceof Error ? caught.message : "Microphone recovery failed.");
+      }
+    });
+  };
+
+  // Re-evaluated as new partial transcript text arrives, and once from a timer armed
+  // at speech start, so confirmed speech interrupts a reply as soon as it has said
+  // something meaningful (not just a quick "um") or has run past the time limit.
+  const checkInterrupt = (candidate: Detector | null, session: number) => {
+    if (!isCurrentVad(candidate, session)) return;
+    if (bargeIn.current.shouldInterruptNow(partialTranscript.current, echoReference.current)) {
+      clearInterruptTimer();
+      interruptActiveTurn();
+      restoreOutput();
+    }
+  };
+
   const toggle = async () => {
     if (!started.current) {
       if (!starting.current) void start();
@@ -1079,6 +1383,8 @@ export default function App({ sessionKey, folder }: AppProps) {
       abortTurn();
       restoreOutput();
       bargeIn.current.reset();
+      clearInterruptTimer();
+      partialTranscript.current = "";
       transcription.current?.reset();
       input.current?.reset();
       stream.current?.getTracks().forEach((track) => { track.enabled = false; });
@@ -1142,6 +1448,13 @@ export default function App({ sessionKey, folder }: AppProps) {
     }
     void start();
   };
+
+  useEffect(() => {
+    // Before the first tap: load the speech detector and have the agent read the
+    // conversation, so neither waits until the user wants to talk.
+    preloadVoiceDetector();
+    void warmConversation();
+  }, [sessionKey]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1244,6 +1557,8 @@ export default function App({ sessionKey, folder }: AppProps) {
     abortTurn();
     restoreOutput();
     bargeIn.current.reset();
+    clearInterruptTimer();
+    partialTranscript.current = "";
     transcription.current?.reset();
     input.current?.reset();
     input.current = null;
@@ -1382,6 +1697,20 @@ export default function App({ sessionKey, folder }: AppProps) {
       </>}
       {voiceError && <p className="voice-settings__error" role="alert">{voiceError}</p>}
       {voiceNotice && <p className="voice-settings__notice" role="status">{voiceNotice}</p>}
+      <label className="voice-settings__label" htmlFor="vad-redemption">
+        End-of-speech wait: {vadRedemptionMs} ms
+      </label>
+      <input
+        id="vad-redemption"
+        type="range"
+        min={vadRedemptionMsMin}
+        max={vadRedemptionMsMax}
+        step={vadRedemptionMsStep}
+        value={vadRedemptionMs}
+        onChange={(event) => changeVadRedemption(Number(event.target.value))}
+        aria-describedby="vad-redemption-hint"
+      />
+      <p id="vad-redemption-hint" className="voice-settings__muted">How long to wait after you stop talking before the reply starts. Lower is snappier; higher avoids cutting off pauses.</p>
       <a className="voice-settings__advanced-link" href="/?settings=speech">Speech engines and servers…</a>
     </div>}
     {onboardingOpen && <div className="voice-onboarding" role="dialog" aria-modal="true" aria-labelledby="voice-onboarding-title">

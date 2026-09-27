@@ -37,7 +37,35 @@ export function prepareAudioBuffer(
 }
 
 // How far ahead of "now" streamed audio is scheduled, to absorb network jitter between chunks.
-const STREAM_LEAD_SECONDS = 0.1;
+// The first chunk of a phrase gets enough lead to ride out network jitter; after an
+// underrun (audio ran dry before the next chunk came) the restart lead doubles, up to a cap.
+export const streamFirstLeadSeconds = 0.1;
+export const streamUnderrunLeadSeconds = 0.02;
+export const streamMaxLeadSeconds = 0.16;
+
+export type StreamSchedule = { nextTime: number; started: boolean; underrunLead: number };
+
+export function freshStreamSchedule(): StreamSchedule {
+  return { nextTime: 0, started: false, underrunLead: streamUnderrunLeadSeconds };
+}
+
+/** When the next merged chunk of `duration` seconds starts, given the audio clock `now`; advances the schedule. */
+export function scheduleStreamChunk(schedule: StreamSchedule, now: number, duration: number): number {
+  let startAt: number;
+  if (!schedule.started) {
+    startAt = now + streamFirstLeadSeconds;
+  } else if (schedule.nextTime < now + streamUnderrunLeadSeconds) {
+    // Ran dry (or about to): restart just ahead of now instead of scheduling in the past, and keep more
+    // audio buffered from here on so a slow network doesn't stutter every chunk.
+    startAt = now + schedule.underrunLead;
+    if (schedule.nextTime < now) schedule.underrunLead = Math.min(streamMaxLeadSeconds, schedule.underrunLead * 2);
+  } else {
+    startAt = schedule.nextTime;
+  }
+  schedule.started = true;
+  schedule.nextTime = startAt + duration;
+  return startAt;
+}
 
 /**
  * Plays raw 16-bit mono PCM while it is still arriving. Resolves once the first audio has come
@@ -116,7 +144,7 @@ export async function prepareAudioStream(
     analyser.fftSize = 128;
     analyser.connect(destination);
     const sources = new Set<AudioBufferSourceNode>();
-    let nextTime = 0;
+    const schedule = freshStreamSchedule();
     let started = false;
     try {
       await new Promise<void>((resolve, reject) => {
@@ -135,10 +163,7 @@ export async function prepareAudioStream(
             const source = audio.createBufferSource();
             source.buffer = buffer;
             source.connect(analyser);
-            // After an underrun, restart just ahead of now instead of scheduling in the past.
-            nextTime = Math.max(nextTime, audio.currentTime + (started ? 0.02 : STREAM_LEAD_SECONDS));
-            source.start(nextTime);
-            nextTime += buffer.duration;
+            source.start(scheduleStreamChunk(schedule, audio.currentTime, buffer.duration));
             sources.add(source);
             source.onended = () => {
               sources.delete(source);

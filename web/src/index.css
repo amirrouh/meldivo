@@ -55,6 +55,7 @@ button { font: inherit; }
 .voice-settings__current, .voice-settings__muted { color: rgb(208 214 228 / .65); }
 .voice-settings__error { color: rgb(255 178 183); }
 .voice-settings__notice { color: rgb(128 232 189); }
+.voice-settings input[type="range"] { width: 100%; margin: 0 0 4px; accent-color: rgb(var(--color)); }
 .voice-settings__actions { display: flex; gap: 7px; margin-top: 14px; }
 .voice-settings__actions button { flex: 1; padding: 8px 9px; border: 1px solid rgb(255 255 255 / .16); border-radius: 8px; color: inherit; background: rgb(255 255 255 / .08); cursor: pointer; font-size: 11px; }
 .voice-settings__actions button:first-child { border-color: rgb(var(--color) / .5); background: rgb(var(--color) / .17); }

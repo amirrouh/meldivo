@@ -152,6 +152,23 @@ test("hub mode: machines join with a one-time code, list their sessions, and run
     assert.equal(statSync(path.join(hubConfig, "hub-key.pem")).mode & 0o777, 0o600);
   });
 
+  await t.test("warming a machine's session runs the warm-up on that machine", async () => {
+    let warmedWith;
+    claude.queueSend(async function* (target, text) {
+      warmedWith = { target, text };
+      yield { type: "session", id: "abc" };
+      yield { type: "delta", text: "ready" };
+      yield { type: "done" };
+    });
+    const response = await fetch(`${base}/api/sessions/${encodeURIComponent("@alpha/claude:abc")}/warm`, { method: "POST", headers: auth });
+    assert.deepEqual(await response.json(), { warmed: true });
+    await eventually(() => warmedWith);
+    assert.equal(warmedWith.target.id, "abc");
+    assert.match(warmedWith.text, /Voice check from meldivo/);
+    const offline = await fetch(`${base}/api/sessions/${encodeURIComponent("@nobody/claude:abc")}/warm`, { method: "POST", headers: auth });
+    assert.deepEqual(await offline.json(), { warmed: false });
+  });
+
   await t.test("a turn is relayed to the machine and its events stream back", async () => {
     claude.queueSend(async function* () {
       yield { type: "session", id: "abc" };

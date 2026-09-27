@@ -12,7 +12,7 @@ import {
   listAllSessions,
 } from "../server/src/harnesses/index.ts";
 import { _killAllWarmOpenCodeServersForTests, checkEventContract } from "../server/src/harnesses/opencode.ts";
-import { isPiCommand } from "../server/src/harnesses/pi.ts";
+import { _closePiProcessesForTests, isPiCommand } from "../server/src/harnesses/pi.ts";
 import http from "node:http";
 
 const FIXTURES = path.join(import.meta.dirname, "fixtures", "harnesses");
@@ -26,6 +26,7 @@ function makeTmpHome(prefix) {
 
 after(() => {
   _killAllWarmOpenCodeServersForTests();
+  _closePiProcessesForTests();
   for (const dir of tmpDirs) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -225,51 +226,153 @@ test("pi listSessions: session_info name wins, falls back to first user message"
   assert.equal(sessions[0].id, "pi-session-b");
 });
 
-test("pi send(): maps message_update text_delta and tool events, honors --fork/--session/new-session", async () => {
-  const home = makeTmpHome("pi-send-");
-  const argsLog = path.join(home, "args.json");
-  const cli = writeFakeCli(
-    home,
-    "fake-pi",
-    `
+// A fake `pi --mode rpc`: answers get_state/prompt/abort/switch_session, logs its argv and every
+// command to $PI_LOG_FILE (one JSON line each), and streams a short reply per prompt.
+const FAKE_PI_RPC = `
 const fs = require("fs");
+const log = (entry) => process.env.PI_LOG_FILE && fs.appendFileSync(process.env.PI_LOG_FILE, JSON.stringify(entry) + "\\n");
 const args = process.argv.slice(2);
-if (process.env.ARGS_LOG_FILE) fs.writeFileSync(process.env.ARGS_LOG_FILE, JSON.stringify(args));
-const lines = [
-  { type: "session", id: "pi-new-id", cwd: process.cwd() },
-  { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hi " } },
-  { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "there" } },
-  { type: "tool_execution_start", toolCallId: "1", toolName: "bash", args: {} },
-  { type: "agent_settled" },
-];
-for (const l of lines) process.stdout.write(JSON.stringify(l) + "\\n");
-`,
-  );
+log({ pid: process.pid, args });
+const out = (record) => process.stdout.write(JSON.stringify(record) + "\\n");
+const forkIdx = args.indexOf("--fork");
+const sessionIdx = args.indexOf("--session");
+const id = forkIdx >= 0 ? "pi-fork-" + process.pid : sessionIdx >= 0 ? "pi-session-a" : "pi-new-id";
+const file = process.env.PI_SESSION_DIR + "/" + id + ".jsonl";
+let timer;
+let buffered = "";
+process.stdin.on("data", (chunk) => {
+  buffered += chunk;
+  let idx;
+  while ((idx = buffered.indexOf("\\n")) >= 0) {
+    const cmd = JSON.parse(buffered.slice(0, idx));
+    buffered = buffered.slice(idx + 1);
+    log({ pid: process.pid, cmd: cmd.type, message: cmd.message });
+    if (cmd.type === "get_state") out({ id: cmd.id, type: "response", command: "get_state", success: true, data: { sessionId: id, sessionFile: file } });
+    else if (cmd.type === "switch_session") out({ id: cmd.id, type: "response", command: "switch_session", success: true, data: { cancelled: false } });
+    else if (cmd.type === "abort") {
+      clearTimeout(timer);
+      out({ type: "agent_settled" });
+      out({ id: cmd.id, type: "response", command: "abort", success: true });
+    } else if (cmd.type === "prompt") {
+      out({ id: cmd.id, type: "response", command: "prompt", success: true });
+      out({ type: "agent_start" });
+      out({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hi " } });
+      out({ type: "tool_execution_start", toolCallId: "1", toolName: "bash", args: {} });
+      if (cmd.message === "slow") {
+        timer = setTimeout(() => out({ type: "agent_settled" }), 10000);
+        continue;
+      }
+      out({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "there" } });
+      fs.appendFileSync(file, JSON.stringify({ type: "message" }) + "\\n");
+      out({ type: "agent_settled" });
+    }
+  }
+});
+`;
 
-  const adapter = createPiAdapter({ home, bin: cli });
-  process.env.ARGS_LOG_FILE = argsLog;
+function readPiLog(logFile) {
+  return readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+}
+
+async function withFakePi(prefix, run) {
+  const home = makeTmpHome(prefix);
+  const sessionDir = path.join(home, "sessions");
+  mkdirSync(sessionDir);
+  const logFile = path.join(home, "pi-log.jsonl");
+  process.env.PI_LOG_FILE = logFile;
+  process.env.PI_SESSION_DIR = sessionDir;
   try {
+    const adapter = createPiAdapter({ home, bin: writeFakeCli(home, "fake-pi", FAKE_PI_RPC) });
+    await run({ adapter, home, sessionDir, log: () => readPiLog(logFile) });
+  } finally {
+    _closePiProcessesForTests();
+    delete process.env.PI_LOG_FILE;
+    delete process.env.PI_SESSION_DIR;
+  }
+}
+
+test("pi send(): streams text and tool events from a warm rpc process", async () => {
+  await withFakePi("pi-send-", async ({ adapter, home, log }) => {
     const events = await collect(adapter.send({ id: null, cwd: home, fork: false }, "hi", new AbortController().signal));
-    assert.deepEqual(
-      events.map((e) => e.type),
-      ["session", "delta", "delta", "tool", "done"],
-    );
+    assert.deepEqual(events.map((e) => e.type), ["session", "delta", "tool", "delta", "done"]);
     assert.equal(events[0].id, "pi-new-id");
     assert.equal(events[1].text, "Hi ");
-    assert.equal(events[3].name, "bash");
+    assert.equal(events[2].name, "bash");
+    const [start] = log();
+    assert.deepEqual(start.args.slice(0, 2), ["--mode", "rpc"]);
+    assert.ok(!start.args.includes("--session"));
+    assert.ok(!start.args.includes("--fork"));
+  });
+});
 
-    const newArgs = readArgsLog(argsLog);
-    assert.ok(!newArgs.includes("--session"));
-    assert.ok(!newArgs.includes("--fork"));
-    assert.ok(newArgs.includes("--mode"));
-    assert.ok(newArgs.includes("json"));
+test("pi send(): later turns reuse the warm process; a fork starts its own and is reused after", async () => {
+  await withFakePi("pi-reuse-", async ({ adapter, home, log }) => {
+    const target = { id: "pi-session-a", cwd: home, fork: false };
+    await collect(adapter.send(target, "one", new AbortController().signal));
+    await collect(adapter.send(target, "two", new AbortController().signal));
+    const starts = log().filter((entry) => entry.args);
+    assert.equal(starts.length, 1, "second turn reused the process");
+    assert.ok(starts[0].args.includes("--session"));
+    const prompts = log().filter((entry) => entry.cmd === "prompt").map((entry) => entry.message);
+    assert.deepEqual(prompts, ["one", "two"]);
+    // Naming the session's recorded model doesn't restart a process that runs it already.
+    await collect(adapter.send({ ...target, model: "local/m1" }, "two-b", new AbortController().signal));
+    assert.equal(log().filter((entry) => entry.args).length, 1);
 
-    await collect(adapter.send({ id: "pi-session-a", cwd: home, fork: true }, "hi", new AbortController().signal));
-    const forkArgs = readArgsLog(argsLog);
-    assert.ok(forkArgs.includes("--fork"));
-  } finally {
-    delete process.env.ARGS_LOG_FILE;
-  }
+    const forked = await collect(adapter.send({ ...target, fork: true }, "three", new AbortController().signal));
+    const forkId = forked[0].id;
+    assert.match(forkId, /^pi-fork-/);
+    await collect(adapter.send({ id: forkId, cwd: home, fork: false }, "four", new AbortController().signal));
+    const forkStarts = log().filter((entry) => entry.args?.includes("--fork"));
+    assert.equal(forkStarts.length, 1);
+    assert.equal(log().filter((entry) => entry.args).length, 2, "the fork's next turn reused its process");
+  });
+});
+
+test("pi send(): a file changed by someone else is reloaded before the next prompt", async () => {
+  await withFakePi("pi-reload-", async ({ adapter, home, sessionDir, log }) => {
+    const target = { id: "pi-session-a", cwd: home, fork: false };
+    await collect(adapter.send(target, "one", new AbortController().signal));
+    await collect(adapter.send(target, "two", new AbortController().signal));
+    assert.equal(log().filter((entry) => entry.cmd === "switch_session").length, 0);
+    writeFileSync(path.join(sessionDir, "pi-session-a.jsonl"), "{}\n", { flag: "a" });
+    await collect(adapter.send(target, "three", new AbortController().signal));
+    assert.equal(log().filter((entry) => entry.cmd === "switch_session").length, 1);
+  });
+});
+
+test("pi send(): cancelling aborts the prompt but keeps the process warm", async () => {
+  await withFakePi("pi-abort-", async ({ adapter, home, log }) => {
+    const target = { id: "pi-session-a", cwd: home, fork: false };
+    const controller = new AbortController();
+    const events = [];
+    for await (const event of adapter.send(target, "slow", controller.signal)) {
+      events.push(event);
+      if (event.type === "tool") controller.abort();
+    }
+    assert.equal(events.at(-1).type, "done");
+    assert.ok(!events.some((e) => e.type === "error"));
+    assert.equal(log().filter((entry) => entry.cmd === "abort").length, 1);
+    const next = await collect(adapter.send(target, "again", new AbortController().signal));
+    assert.ok(next.some((e) => e.type === "delta"));
+    assert.equal(log().filter((entry) => entry.args).length, 1);
+  });
+});
+
+test("pi listSessions: reads only what was appended since the last listing", async () => {
+  const home = makeTmpHome("pi-index-");
+  const dir = path.join(home, ".pi/agent/sessions/--tmp-fixture-c--");
+  mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "2024-01-03T00-00-00-000Z_pi-session-c.jsonl");
+  writeFileSync(file, `${JSON.stringify({ type: "session", id: "pi-session-c", cwd: "/tmp/fixture-c" })}\n`);
+  const adapter = createPiAdapter({ home, bin: "pi-does-not-exist" });
+  assert.equal((await adapter.listSessions())[0].title, "(untitled)");
+  writeFileSync(file, `${JSON.stringify({ type: "message", message: { role: "user", content: "First question" } })}\n{"type":"model_ch`, { flag: "a" });
+  assert.equal((await adapter.listSessions())[0].title, "First question");
+  writeFileSync(file, `ange","provider":"local","modelId":"m1"}\n${JSON.stringify({ type: "session_info", name: "Named" })}\n`, { flag: "a" });
+  const [session] = await adapter.listSessions();
+  assert.equal(session.title, "Named");
+  assert.equal(session.model, "local/m1");
 });
 
 // ---------------------------------------------------------------------------

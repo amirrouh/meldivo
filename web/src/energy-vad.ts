@@ -22,7 +22,7 @@ import {
   vadNegativeSpeechThreshold,
   vadPositiveSpeechThreshold,
   vadPreSpeechPadMs,
-  vadRedemptionMs,
+  defaultVadRedemptionMs,
 } from "./vad-config";
 
 // Match Silero v5's frame contract: 512 samples @ 16 kHz == 32 ms/frame.
@@ -60,7 +60,7 @@ const defaultOptions: ResolvedOptions = {
   positiveSpeechThreshold: vadPositiveSpeechThreshold,
   negativeSpeechThreshold: vadNegativeSpeechThreshold,
   minSpeechMs: vadMinSpeechMs,
-  redemptionMs: vadRedemptionMs,
+  redemptionMs: defaultVadRedemptionMs,
   preSpeechPadMs: vadPreSpeechPadMs,
   maxSpeechMs: defaultMaxSpeechMs,
   noiseFloorWindowFrames: 100, // ~3.2s of trailing silence at 32ms/frame.
